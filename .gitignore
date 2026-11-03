@@ -1,0 +1,23 @@
+# Ignore everything by default.
+/*
+
+# Repository metadata.
+/.gitignore
+!/.gitignore
+!/README.md
+!/LICENSE.gbarecomp
+
+# Standalone generated CMake project.
+!/CMakeLists.txt
+
+# Generated C11 sources and headers.
+!/*.c
+!/*.h
+
+# Runtime headers.
+/gba/
+/gba/*
+!/gba/*.h
+
+# ROMs, saves, binaries, temporary and build artifacts
+# are intentionally excluded by the allowlist above.

@@ -1,0 +1,3446 @@
+/*
+ * GBA Runtime Library - Static Recompilation Runtime
+ *
+ * This is the standalone runtime for statically recompiled GBA games.
+ * No emulator runs underneath - recompiled C code IS the CPU.
+ * Memory is flat arrays, I/O writes dispatch to lightweight hardware modules.
+ *
+ * Hardware provided:
+ *   - Flat memory bus (EWRAM, IWRAM, VRAM, Palette, OAM, ROM, SRAM)
+ *   - 4 hardware timers with prescaler and cascade
+ *   - 4-channel DMA with immediate, VBlank, and HBlank triggers
+ *   - Scanline-based timing (VCOUNT, DISPSTAT, HBlank/VBlank flags)
+ *   - Interrupt delivery (IE/IF/IME -> handler at [0x03007FFC])
+ *   - BIOS HLE (SWI implementations for Div, Sqrt, CpuSet, etc.)
+ */
+
+#include "gba/gba_runtime.h"
+#include "gba/display.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <setjmp.h>
+
+/* SoftReset support: longjmp back to main loop entry */
+static jmp_buf soft_reset_jmp;
+static bool soft_reset_jmp_valid = false;
+
+/* ---- CPU State ---- */
+
+u32  r[16] = {0};
+bool CPU_N = false;
+bool CPU_Z = false;
+bool CPU_C = false;
+bool CPU_V = false;
+
+static u32 cpsr = 0x0000001F; /* System mode, all flags clear */
+static u32 spsr = 0;
+
+/* ---- Memory ---- */
+
+static u8* bios_mem  = NULL;  /* 16KB */
+static u8* ewram     = NULL;  /* 256KB */
+static u8* iwram     = NULL;  /* 32KB */
+u8* io_regs   = NULL;  /* 1KB - non-static for display.c access */
+u8* palette   = NULL;  /* 1KB - non-static for display.c access */
+u8* vram      = NULL;  /* 96KB - non-static for display.c access */
+u8* oam       = NULL;  /* 1KB - non-static for display.c access */
+static u8* rom_data  = NULL;  /* Up to 32MB */
+static u32 rom_size  = 0;
+static u8* sram      = NULL;  /* 64KB */
+
+/* Save file path for SRAM persistence */
+static char sram_path[512] = {0};
+
+/* ---- EEPROM (8KB EEPROM_V) ----
+ * Bit-serial protocol over DMA3 to/from cart at 0x0D000000-0x0DFFFFFF.
+ * Game writes command bits via bus_write16 (only bit 0 matters), then
+ * reads response bits via bus_read16 (only bit 0 matters).
+ *
+ * Read sequence:
+ *   write: 2 bits "11" + 14 (or 6) addr bits + 1 stop bit
+ *   read:  4 dummy bits + 64 data bits
+ *
+ * Write sequence:
+ *   write: 2 bits "10" + 14 (or 6) addr bits + 64 data bits + 1 stop bit
+ *
+ * Idle reads return bit 0 = 1 ("ready"), which is what save-detection
+ * polling loops expect after a DMA completes.
+ */
+typedef enum {
+    EE_IDLE,
+    EE_READ_ADDR,
+    EE_READ_STOP,
+    EE_READ_OUT,
+    EE_WRITE_ADDR,
+    EE_WRITE_DATA,
+    EE_WRITE_STOP,
+} EepromMode;
+
+static struct {
+    bool present;
+    bool large;              /* 64Kbit (8KB) vs 4Kbit (512B) */
+    EepromMode mode;
+    int bit_cnt;
+    u32 cmd_bits;            /* first 2 command bits */
+    u32 addr_buf;
+    u64 data_buf;
+    u32 cur_addr;
+    int read_bit_idx;
+    u8 storage[0x2000];      /* 8 KB max */
+    char path[512];
+} eeprom;
+
+static u16 eeprom_read(void) {
+    if (eeprom.mode == EE_READ_OUT) {
+        int idx = eeprom.bit_cnt++;
+        if (eeprom.bit_cnt >= 68) {
+            eeprom.mode = EE_IDLE;
+            eeprom.bit_cnt = 0;
+        }
+        if (idx < 4) return 0;
+        int data_idx = idx - 4;
+        int byte_off = eeprom.cur_addr * 8 + (data_idx >> 3);
+        int bit_off = 7 - (data_idx & 7);
+        if (byte_off >= (int)sizeof(eeprom.storage)) return 0;
+        return (eeprom.storage[byte_off] >> bit_off) & 1;
+    }
+    /* Idle or busy: report ready */
+    return 1;
+}
+
+static void eeprom_write(u16 value) {
+    u8 bit = value & 1;
+    int addr_bits = eeprom.large ? 14 : 6;
+
+    switch (eeprom.mode) {
+    case EE_IDLE:
+        eeprom.cmd_bits = (eeprom.cmd_bits << 1) | bit;
+        eeprom.bit_cnt++;
+        if (eeprom.bit_cnt == 2) {
+            u32 c = eeprom.cmd_bits & 3;
+            eeprom.cmd_bits = 0;
+            eeprom.bit_cnt = 0;
+            if (c == 3) eeprom.mode = EE_READ_ADDR;        /* 11 = read */
+            else if (c == 2) eeprom.mode = EE_WRITE_ADDR;  /* 10 = write */
+            /* else invalid - stay idle */
+        }
+        break;
+    case EE_READ_ADDR:
+        eeprom.addr_buf = (eeprom.addr_buf << 1) | bit;
+        eeprom.bit_cnt++;
+        if (eeprom.bit_cnt == addr_bits) {
+            eeprom.cur_addr = eeprom.addr_buf & ((1u << addr_bits) - 1);
+            eeprom.addr_buf = 0;
+            eeprom.bit_cnt = 0;
+            eeprom.mode = EE_READ_STOP;
+        }
+        break;
+    case EE_READ_STOP:
+        /* 1 stop bit, then ready to output */
+        eeprom.mode = EE_READ_OUT;
+        eeprom.bit_cnt = 0;
+        break;
+    case EE_WRITE_ADDR:
+        eeprom.addr_buf = (eeprom.addr_buf << 1) | bit;
+        eeprom.bit_cnt++;
+        if (eeprom.bit_cnt == addr_bits) {
+            eeprom.cur_addr = eeprom.addr_buf & ((1u << addr_bits) - 1);
+            eeprom.addr_buf = 0;
+            eeprom.bit_cnt = 0;
+            eeprom.mode = EE_WRITE_DATA;
+        }
+        break;
+    case EE_WRITE_DATA:
+        eeprom.data_buf = (eeprom.data_buf << 1) | (u64)bit;
+        eeprom.bit_cnt++;
+        if (eeprom.bit_cnt == 64) {
+            int base = eeprom.cur_addr * 8;
+            if (base + 8 <= (int)sizeof(eeprom.storage)) {
+                for (int i = 0; i < 8; i++) {
+                    eeprom.storage[base + i] = (u8)(eeprom.data_buf >> (56 - i * 8));
+                }
+            }
+            eeprom.data_buf = 0;
+            eeprom.bit_cnt = 0;
+            eeprom.mode = EE_WRITE_STOP;
+        }
+        break;
+    case EE_WRITE_STOP:
+        /* 1 stop bit, then ready (we skip the busy phase) */
+        eeprom.mode = EE_IDLE;
+        eeprom.bit_cnt = 0;
+        break;
+    default:
+        eeprom.mode = EE_IDLE;
+        eeprom.bit_cnt = 0;
+        break;
+    }
+}
+
+/* Returns true if addr is an EEPROM access for this cart.
+ * For ROM <= 16MB the whole 0x0D region is EEPROM; for larger ROMs only
+ * 0x0DFFFF00-0x0DFFFFFF (LttP is 8MB so the simple test suffices). */
+static inline bool is_eeprom_addr(u32 addr) {
+    if (!eeprom.present) return false;
+    if (rom_size > 0x01000000) return (addr & 0x0FFFFF00) == 0x0DFFFF00;
+    return (addr >> 24) == 0x0D;
+}
+
+static void eeprom_detect(void) {
+    /* Scan ROM for "EEPROM_V" magic (Nintendo SDK marker). */
+    if (rom_size < 8) return;
+    const char* needle = "EEPROM_V";
+    for (u32 i = 0; i + 8 <= rom_size; i++) {
+        if (memcmp(rom_data + i, needle, 8) == 0) {
+            eeprom.present = true;
+            eeprom.large = true;  /* default 64Kbit; real detection is via DMA size */
+            fprintf(stderr, "[runtime] EEPROM detected at ROM 0x%08X (assuming 8KB)\n",
+                    0x08000000 + i);
+            return;
+        }
+    }
+}
+
+static void eeprom_load(void) {
+    if (!eeprom.present || !eeprom.path[0]) return;
+    FILE* f = fopen(eeprom.path, "rb");
+    if (f) {
+        fread(eeprom.storage, 1, sizeof(eeprom.storage), f);
+        fclose(f);
+        fprintf(stderr, "[runtime] Loaded EEPROM from %s\n", eeprom.path);
+    }
+}
+
+static void eeprom_save(void) {
+    if (!eeprom.present || !eeprom.path[0]) return;
+    FILE* f = fopen(eeprom.path, "wb");
+    if (f) {
+        fwrite(eeprom.storage, 1, sizeof(eeprom.storage), f);
+        fclose(f);
+    }
+}
+
+/* ---- Flash backup (FLASH_V / FLASH512_V / FLASH1M_V) ----
+ *
+ * Command protocol (GBATEK "GBA Cart Backup Flash ROM"): AA->5555, 55->2AAA,
+ * then the command byte to 5555. 90/F0 enter/leave ID mode, 80 arms an erase
+ * (10 = chip, 30 to a sector = 4KB sector), A0 programs the next byte,
+ * B0 selects the 64KB bank on 1Mbit parts. The backing store is `sram`
+ * (128KB when Flash is present) so the existing .sav load/save covers it. */
+static struct {
+    bool present;
+    bool large;          /* FLASH1M: 128KB, two banks */
+    int  stage;          /* 0 idle, 1 got AA, 2 got 55 */
+    bool id_mode, erase_armed, write_next, bank_next;
+    u32  bank;
+    /* Programming takes time: the written sector reads busy (data bit 7
+     * inverted, "data# polling") for 650 cycles after a byte and 30000
+     * after a sector erase, as in mGBA. Games poll until it settles. */
+    u32  busy_until, busy_sector;
+} flash;
+
+static u32 cycle_counter;   /* defined with the scheduler below */
+
+static void flash_settle(u32 off, u32 cycles) {
+    flash.busy_sector = flash.bank * 16 + (off >> 12);
+    flash.busy_until = cycle_counter + cycles;
+}
+
+static u32 backup_size = 0x10000;
+
+static void flash_detect(void) {
+    static const char* tags[] = { "FLASH1M_V", "FLASH512_V", "FLASH_V", NULL };
+    for (u32 i = 0; i + 10 <= rom_size; i++) {
+        if (rom_data[i] != 'F') continue;
+        for (int t = 0; tags[t]; t++) {
+            if (memcmp(rom_data + i, tags[t], strlen(tags[t])) == 0) {
+                flash.present = true;
+                flash.large = (t == 0);
+                fprintf(stderr, "[runtime] Flash %s detected (%s)\n",
+                        flash.large ? "128KB" : "64KB", tags[t]);
+                return;
+            }
+        }
+    }
+}
+
+static u8 backup_read8(u32 addr) {
+    u32 off = addr & 0xFFFF;
+    if (flash.present) {
+        if (flash.id_mode && off < 2) {
+            /* Sanyo LE26FV10N1TS (1M) / Panasonic MN63F805MNP (512K) */
+            static const u8 id_small[2] = { 0x32, 0x1B }, id_large[2] = { 0x62, 0x13 };
+            return flash.large ? id_large[off] : id_small[off];
+        }
+        u8 v = sram[flash.bank * 0x10000 + off];
+        if ((s32)(flash.busy_until - cycle_counter) > 0 && flash.busy_sector == flash.bank * 16 + (off >> 12))
+            return (v ^ 0x80) & 0x80;
+        return v;
+    }
+    return sram[off];
+}
+
+static void backup_write8(u32 addr, u8 val) {
+    u32 off = addr & 0xFFFF;
+    if (!flash.present) { sram[off] = val; return; }
+    u8* base = sram + flash.bank * 0x10000;
+    if (flash.write_next) { base[off] = val; flash.write_next = false; flash_settle(off, 650); return; }
+    if (flash.bank_next) {
+        if (off == 0 && flash.large) flash.bank = val & 1;
+        flash.bank_next = false; return;
+    }
+    if (flash.stage == 0 && off == 0x5555 && val == 0xAA) { flash.stage = 1; return; }
+    if (flash.stage == 1 && off == 0x2AAA && val == 0x55) { flash.stage = 2; return; }
+    if (flash.stage == 2) {
+        flash.stage = 0;
+        if (flash.erase_armed && val == 0x30) {           /* sector erase */
+            memset(base + (off & 0xF000), 0xFF, 0x1000);
+            flash_settle(off, 30000);
+            flash.erase_armed = false; return;
+        }
+        if (off != 0x5555) return;
+        if (flash.erase_armed && val == 0x10) {           /* chip erase */
+            memset(sram, 0xFF, backup_size);
+            flash.erase_armed = false; return;
+        }
+        switch (val) {
+        case 0x90: flash.id_mode = true; break;
+        case 0xF0: flash.id_mode = false; break;
+        case 0x80: flash.erase_armed = true; break;
+        case 0xA0: flash.write_next = true; break;
+        case 0xB0: flash.bank_next = true; break;
+        }
+        return;
+    }
+    flash.stage = 0;
+}
+
+/* ---- I/O Register Helpers ---- */
+
+static inline u16 io_read16(u32 offset) {
+    return (u16)io_regs[offset] | ((u16)io_regs[offset + 1] << 8);
+}
+
+static inline void io_write16(u32 offset, u16 val) {
+    io_regs[offset]     = (u8)(val);
+    io_regs[offset + 1] = (u8)(val >> 8);
+}
+
+static inline u32 io_read32(u32 offset) {
+    return io_regs[offset] | (io_regs[offset+1] << 8) |
+           (io_regs[offset+2] << 16) | (io_regs[offset+3] << 24);
+}
+
+static inline void io_write32(u32 offset, u32 val) {
+    io_regs[offset]   = (u8)(val);
+    io_regs[offset+1] = (u8)(val >> 8);
+    io_regs[offset+2] = (u8)(val >> 16);
+    io_regs[offset+3] = (u8)(val >> 24);
+}
+
+/* GBA_DIRECT_SOUND_FIX_V1: Direct Sound FIFO A/B, sample clock, SDL2 output.
+ * The GBA APU also has four PSG voices; those are NOT implemented here. */
+#define GBA_AUDIO_CPU_HZ 16777216u
+#define GBA_AUDIO_HZ 32768u
+#define GBA_AUDIO_CYCLES_PER_SAMPLE (GBA_AUDIO_CPU_HZ / GBA_AUDIO_HZ)
+#define GBA_AUDIO_BLOCK_FRAMES 512u
+
+typedef struct {
+    u8 samples[32];
+    unsigned head, size;
+    s8 last;
+    unsigned long long pops, refills, writes;
+} GbaSoundFifo;
+
+static GbaSoundFifo gba_sound_fifo[2];
+static s16 gba_audio_pcm[GBA_AUDIO_BLOCK_FRAMES * 2];
+static unsigned gba_audio_pcm_frames;
+static u32 gba_audio_cycle_phase;
+static unsigned long long gba_audio_frames, gba_audio_nonzero;
+static bool gba_audio_dma_busy[4];
+/* GBA_AUDIO_DIAG_V4: opt-in MP2K/Direct Sound tracing; never alter playback. */
+static bool gba_audio_diag_enabled;
+static FILE *gba_audio_diag_wav;
+static unsigned gba_audio_diag_wav_written;
+static unsigned gba_audio_diag_period;
+static unsigned gba_audio_diag_peak;
+static unsigned gba_audio_diag_samples, gba_audio_diag_nonzero;
+static unsigned long long gba_audio_diag_underflow[2];
+static unsigned long long gba_audio_diag_previous_underflow[2];
+static unsigned long long gba_audio_diag_previous_refills[2];
+static void gba_audio_diag_init(void);
+static void gba_audio_diag_note(s16 left, s16 right);
+static void gba_audio_diag_write(const s16 *samples, unsigned frames);
+static void gba_audio_diag_finish(void);
+/* GBA_AUDIO_DECLICK_V3: ease transitions from a previously held FIFO sample,
+ * especially when the game enables the mixer at the boot logos.  No ongoing
+ * filtering or gain change once the short ramp finishes. */
+#define GBA_AUDIO_DECLICK_SAMPLES 1024u /* 31.25 ms at 32768 Hz */
+static int gba_audio_previous_pcm[2];
+static int gba_audio_ramp_from[2];
+static unsigned gba_audio_ramp_remaining;
+static bool gba_audio_master_was_on;
+static bool gba_audio_wait_for_first_sample = true;
+static unsigned long long gba_audio_ramps;
+
+static void gba_audio_start_ramp(void) {
+    gba_audio_ramp_from[0] = gba_audio_previous_pcm[0];
+    gba_audio_ramp_from[1] = gba_audio_previous_pcm[1];
+    gba_audio_ramp_remaining = GBA_AUDIO_DECLICK_SAMPLES;
+    gba_audio_ramps++;
+}
+
+static bool gba_audio_is_fifo_dma(int ch, u16 control, u32 dst);
+static void gba_audio_fifo_reset(int which);
+static void gba_audio_fifo_write(u32 io_offset, u32 value, int byte_count);
+static void gba_audio_timer_overflow(int timer);
+static void gba_audio_output_cycles(u32 cycles);
+static void gba_audio_flush(void);
+static void gba_audio_report(void);
+
+/* ---- Hardware Timing ---- */
+
+static u32 cycle_counter = 0;
+static u32 scanline = 0;          /* Current VCOUNT (0-227) */
+static u32 frame_count = 0;
+static u32 scanline_cycles = 0;   /* Cycles within current scanline */
+static u32 hblank_done = 0;       /* this line's HBlank has fired */
+static u32 last_poll_cycle = 0;
+
+#define CYCLES_PER_SCANLINE  1232
+#define VISIBLE_SCANLINES    160
+#define VBLANK_SCANLINES     68
+#define SCANLINES_PER_FRAME  228
+#define CYCLES_PER_FRAME     (CYCLES_PER_SCANLINE * SCANLINES_PER_FRAME)
+#define HBLANK_START_CYCLE   960   /* HBlank starts ~960 cycles into scanline */
+#define POLL_INTERVAL        10000
+
+/* ---- Forward Declarations ---- */
+
+static void timer_tick(u32 cycles);
+static void dma_transfer(int channel);
+static void dma_execute(int channel);
+static void dma_trigger_vblank(void);
+static void dma_trigger_hblank(void);
+static void check_interrupts(void);
+static void io_write_hook(u32 offset, u32 value, int size);
+
+/* ---- Timer Hardware ---- */
+
+/* GBA has 4 hardware timers (TM0-TM3).
+ * Each has a 16-bit counter, reload value, and control register.
+ * Timers can cascade (increment when the previous timer overflows). */
+
+static const u16 timer_prescaler_shift[4] = { 0, 6, 8, 10 };
+/* Prescaler 0=1, 1=64, 2=256, 3=1024 -> shift values for division */
+
+typedef struct {
+    u32 internal_counter;  /* Sub-prescaler accumulator */
+    u16 counter;           /* Current timer value (TMXCNT_L read value) */
+    u16 reload;            /* Reload value (TMXCNT_L write value) */
+    u16 control;           /* TMXCNT_H */
+    bool running;          /* Cached from control bit 7 */
+    bool cascade;          /* Cached from control bit 2 */
+    int prescaler;         /* Cached prescaler selection (0-3) */
+} HWTimer;
+
+static HWTimer timers[4] = {0};
+
+#define TIMER_REG_BASE  0x100
+#define TIMER_CNT_L(n)  (TIMER_REG_BASE + (n) * 4)
+#define TIMER_CNT_H(n)  (TIMER_REG_BASE + (n) * 4 + 2)
+
+/* Timer overflow: increment counter, check for cascade/IRQ */
+static void timer_overflow(int idx) {
+    timers[idx].counter = timers[idx].reload;
+    if (idx < 2) gba_audio_timer_overflow(idx);
+
+    /* Fire timer IRQ if enabled */
+    if (timers[idx].control & (1 << 6)) {
+        u16 if_val = io_read16(0x202);
+        if_val |= (u16)(1 << (3 + idx)); /* Timer 0-3 = IRQ bits 3-6 */
+        io_write16(0x202, if_val);
+    }
+
+    /* Cascade: if next timer exists and is in cascade mode, tick it */
+    if (idx < 3 && timers[idx + 1].running && timers[idx + 1].cascade) {
+        timers[idx + 1].counter++;
+        if (timers[idx + 1].counter == 0) { /* Overflow */
+            timer_overflow(idx + 1);
+        }
+    }
+}
+
+static void timer_tick_raw(u32 cycles) {
+    for (int i = 0; i < 4; i++) {
+        if (!timers[i].running || timers[i].cascade) continue;
+
+        u32 shift = timer_prescaler_shift[timers[i].prescaler];
+        timers[i].internal_counter += cycles;
+
+        u32 ticks = timers[i].internal_counter >> shift;
+        timers[i].internal_counter &= (1u << shift) - 1;
+
+        while (ticks > 0) {
+            u32 until_overflow = (u32)(0x10000 - timers[i].counter);
+            if (ticks >= until_overflow) {
+                ticks -= until_overflow;
+                timer_overflow(i);
+            } else {
+                timers[i].counter += (u16)ticks;
+                ticks = 0;
+            }
+        }
+    }
+}
+
+/* Advance to the next audio sample or timer overflow before continuing.
+ * This preserves FIFO playback order when a charge spans multiple ticks.
+ * Mix BEFORE each timer-overflow edge so the newly clocked FIFO sample is
+ * held for the following 32768-Hz output interval. */
+static void timer_tick(u32 cycles) {
+    while (cycles) {
+        u32 step = cycles;
+        u32 to_sample = GBA_AUDIO_CYCLES_PER_SAMPLE - gba_audio_cycle_phase;
+        if (step > to_sample) step = to_sample;
+        for (int i = 0; i < 2; ++i) {
+            if (!timers[i].running || timers[i].cascade) continue;
+            u32 prescale = 1u << timer_prescaler_shift[timers[i].prescaler];
+            u32 to_overflow = (0x10000u - timers[i].counter) * prescale
+                              - timers[i].internal_counter;
+            if (to_overflow && step > to_overflow) step = to_overflow;
+        }
+        gba_audio_output_cycles(step);
+        timer_tick_raw(step);
+        cycles -= step;
+    }
+}
+
+/* Handle timer control register write */
+static void timer_write_control(int idx, u16 value) {
+    bool was_running = timers[idx].running;
+    bool now_running = (value >> 7) & 1;
+
+    timers[idx].control = value;
+    timers[idx].prescaler = value & 3;
+    timers[idx].cascade = (value >> 2) & 1;
+    timers[idx].running = now_running;
+
+    /* Starting a stopped timer reloads the counter */
+    if (!was_running && now_running) {
+        timers[idx].counter = timers[idx].reload;
+        timers[idx].internal_counter = 0;
+    }
+
+    /* Write back to I/O registers */
+    io_write16(TIMER_CNT_H(idx), value);
+}
+
+/* ---- DMA Controller ---- */
+
+#define DMA_REG_BASE  0x0B0
+#define DMA_SAD(n)    (DMA_REG_BASE + (n) * 12)
+#define DMA_DAD(n)    (DMA_REG_BASE + (n) * 12 + 4)
+#define DMA_CNT_L(n)  (DMA_REG_BASE + (n) * 12 + 8)
+#define DMA_CNT_H(n)  (DMA_REG_BASE + (n) * 12 + 10)
+
+/* Latched source/destination addresses (reloaded on DMA enable) */
+static u32 dma_src_latch[4] = {0};
+/* Who is on the bus, for timing (see data_cycles) */
+enum { BUS_ROM_CODE, BUS_RAM_CODE, BUS_DMA, BUS_BIOS_HLE };
+static u32 bus_mode = BUS_ROM_CODE;
+/* Inside a store-multiple after its first word: mGBA's STM waits for one
+ * VRAM slot and the burst's own cycles cover the rest */
+static bool vram_burst;
+static u32 dma_dst_latch[4] = {0};
+
+/* GBA_MP2K_PCM_RING_GUARD_V5: MP2K FIFO ring protection.
+ * In Aria, the signed PCM8 ring is soundInfo+0x350, 0x630 bytes long.
+ * The jump table follows it immediately in IWRAM. When audio DMA runs
+ * beyond the end (typically at a VSync/timer boundary), those function
+ * pointers become very loud PCM samples. Only MP2K FIFO DMA is affected.
+ * GBA_MP2K_PCM_GUARD=0 disables this containment for A/B diagnosis.
+ * Proper DMA/VSync edge emulation should eventually make this unnecessary. */
+static unsigned long long gba_mp2k_pcm_ring_wraps;
+
+static u32 gba_mp2k_pcm_base(void) {
+    if (!iwram) return 0;
+    /* m4a engine pointer at 0x03007FF0. Read raw IWRAM: no bus cycles. */
+    const u8 *p = iwram + 0x7FF0;
+    u32 info = (u32)p[0] | ((u32)p[1] << 8) |
+               ((u32)p[2] << 16) | ((u32)p[3] << 24);
+    if ((info & 0xFFFF8000u) != 0x03000000u) return 0;
+    u32 off = info & 0x7FFFu;
+    if (off > 0x8000u - 0x350u - 0x630u) return 0;
+    p = iwram + off;
+    u32 magic = (u32)p[0] | ((u32)p[1] << 8) |
+                ((u32)p[2] << 16) | ((u32)p[3] << 24);
+    /* "Smsh" plus transient MP2K lock increments. */
+    if ((magic & 0xFFFFFF00u) != 0x68736D00u) return 0;
+    return info + 0x350u;
+}
+
+static u32 gba_mp2k_pcm_dma_wrap(u32 source, int channel) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *s = getenv("GBA_MP2K_PCM_GUARD");
+        enabled = (!s || *s != '0') ? 1 : 0;
+    }
+    if (!enabled) return source;
+    u32 base = gba_mp2k_pcm_base();
+    if (!base) return source;
+    const u32 end = base + 0x630u;
+    /* The legitimate FIFO source must be in the 0x630-byte PCM buffer.
+     * A DMA transfer of four words may cross its end. Do not touch ROM,
+     * unrelated IWRAM or other DMA channels. */
+    if (source < end || source >= end + 16u) return source;
+    u32 wrapped = base + (source - end);
+    gba_mp2k_pcm_ring_wraps++;
+    if (gba_mp2k_pcm_ring_wraps <= 6u && getenv("GBA_AUDIO_STATS"))
+        fprintf(stderr,
+                "[audio] MP2K PCM DMA channel %d crossed ring at %08X -> %08X (wrap %llu)\n",
+                channel, source, wrapped, gba_mp2k_pcm_ring_wraps);
+    return wrapped;
+}
+
+static void dma_transfer(int channel) {
+    u32 base = DMA_REG_BASE + channel * 12;
+    u32 src = dma_src_latch[channel];
+    u32 dst = dma_dst_latch[channel];
+    u16 cnt_lo = io_read16(base + 8);
+    u16 cnt_hi = io_read16(base + 10);
+
+    u32 count = cnt_lo;
+    if (count == 0) {
+        count = (channel == 3) ? 0x10000 : 0x4000;
+    }
+
+    bool fifo_dma = gba_audio_is_fifo_dma(channel, cnt_hi, dst);
+    if (fifo_dma) count = 4; /* FIFO DMA always transfers 16 bytes */
+    bool word = fifo_dma || ((cnt_hi >> 10) & 1);
+    int dst_ctrl = fifo_dma ? 2 : ((cnt_hi >> 5) & 3);
+    int src_ctrl = (cnt_hi >> 7) & 3;
+    u32 size = word ? 4 : 2;
+
+    u32 saved_mode = bus_mode;
+    bus_mode = BUS_DMA;
+    for (u32 i = 0; i < count; i++) {
+        if (fifo_dma) src = gba_mp2k_pcm_dma_wrap(src, channel);
+        if (word) {
+            u32 val = bus_read32(src);
+            bus_write32(dst, val);
+        } else {
+            u16 val = bus_read16(src);
+            bus_write16(dst, val);
+        }
+
+        switch (src_ctrl) {
+            case 0: src += size; break;
+            case 1: src -= size; break;
+            case 2: break;
+        }
+        switch (dst_ctrl) {
+            case 0: case 3: dst += size; break;
+            case 1: dst -= size; break;
+            case 2: break;
+        }
+    }
+    bus_mode = saved_mode;
+
+    /* Update latched addresses */
+    dma_src_latch[channel] = src;
+    if (dst_ctrl != 3) {
+        dma_dst_latch[channel] = dst;
+    }
+    /* dst_ctrl 3 = increment/reload: dst reloads on next trigger */
+
+    /* Check repeat bit */
+    bool repeat = fifo_dma || ((cnt_hi >> 9) & 1);
+    int timing = (cnt_hi >> 12) & 3;
+
+    if (!repeat || timing == 0) {
+        /* Clear enable bit */
+        cnt_hi &= ~(1u << 15);
+        io_write16(base + 10, cnt_hi);
+    }
+
+    /* Fire DMA IRQ if enabled */
+    if (cnt_hi & (1 << 14)) {
+        u16 if_val = io_read16(0x202);
+        if_val |= (u16)(1 << (8 + channel));
+        io_write16(0x202, if_val);
+    }
+}
+
+static void dma_execute(int channel) {
+    u16 cnt_hi = io_read16(DMA_CNT_H(channel));
+    if (!(cnt_hi & (1 << 15))) return;
+
+    int timing = (cnt_hi >> 12) & 3;
+    if (timing == 0) {
+        /* Immediate DMA */
+        dma_transfer(channel);
+    }
+    /* VBlank/HBlank/Special DMAs are deferred to their trigger points */
+}
+
+/* Latch addresses when DMA is enabled */
+static void dma_enable(int channel) {
+    u32 base = DMA_REG_BASE + channel * 12;
+    dma_src_latch[channel] = io_read32(base);
+    dma_dst_latch[channel] = io_read32(base + 4);
+}
+
+static void dma_trigger_vblank(void) {
+    for (int ch = 0; ch < 4; ch++) {
+        u16 cnt_hi = io_read16(DMA_CNT_H(ch));
+        if ((cnt_hi & (1 << 15)) && ((cnt_hi >> 12) & 3) == 1) {
+            dma_transfer(ch);
+        }
+    }
+}
+
+static void dma_trigger_hblank(void) {
+    for (int ch = 0; ch < 4; ch++) {
+        u16 cnt_hi = io_read16(DMA_CNT_H(ch));
+        if ((cnt_hi & (1 << 15)) && ((cnt_hi >> 12) & 3) == 2) {
+            dma_transfer(ch);
+        }
+    }
+}
+
+/* GBA_DIRECT_SOUND_FIX_V1 implementation */
+static void gba_audio_fifo_reset(int which) {
+    GbaSoundFifo *f = &gba_sound_fifo[which];
+    f->head = 0;
+    f->size = 0;
+    f->last = 0;
+    /* A FIFO reset changes a sample immediately.  Crossfade the output only
+     * if it was audible; otherwise soften the next actual sound onset. */
+    if (gba_audio_previous_pcm[0] || gba_audio_previous_pcm[1])
+        gba_audio_start_ramp();
+    else
+        gba_audio_wait_for_first_sample = true;
+}
+
+static void gba_audio_fifo_write(u32 off, u32 value, int bytes) {
+    int which = off >= 0x0A4u ? 1 : 0;
+    GbaSoundFifo *f = &gba_sound_fifo[which];
+    for (int i = 0; i < bytes; ++i) {
+        if (f->size < 32u) {
+            f->samples[(f->head + f->size) & 31u] = (u8)(value >> (8 * i));
+            f->size++;
+        }
+        f->writes++;
+    }
+}
+
+/* FIFO DMA special timing is independent of the normal DMA word count:
+ * always exactly four 32-bit writes to FIFO A/B, destination held fixed.
+ * Source address increments unless source-control selects decrement/fixed. */
+static bool gba_audio_is_fifo_dma(int ch, u16 control, u32 dst) {
+    return (ch == 1 || ch == 2) &&
+           (control & 0x8000u) &&
+           ((control >> 12) & 3u) == 3u &&
+           ((dst & ~3u) == 0x040000A0u || (dst & ~3u) == 0x040000A4u);
+}
+
+static void gba_audio_refill(int which) {
+    u32 dst = which ? 0x040000A4u : 0x040000A0u;
+    for (int ch = 1; ch <= 2; ++ch) {
+        u16 ctrl = io_read16(DMA_CNT_H(ch));
+        if (!gba_audio_is_fifo_dma(ch, ctrl, dma_dst_latch[ch]) ||
+            (dma_dst_latch[ch] & ~3u) != dst || gba_audio_dma_busy[ch])
+            continue;
+        gba_audio_dma_busy[ch] = true;
+        dma_transfer(ch);
+        gba_audio_dma_busy[ch] = false;
+        gba_sound_fifo[which].refills++;
+    }
+}
+
+static void gba_audio_timer_overflow(int timer) {
+    u16 cnt_h = io_read16(0x082);
+    for (int ch = 0; ch < 2; ++ch) {
+        int selected_timer = ch ? ((cnt_h >> 14) & 1u) : ((cnt_h >> 10) & 1u);
+        if (selected_timer != timer) continue;
+        GbaSoundFifo *f = &gba_sound_fifo[ch];
+        if (!f->size && gba_audio_diag_enabled && (io_regs[0x084] & 0x80u)
+            && (cnt_h & (ch ? 0x3000u : 0x0300u)))
+            gba_audio_diag_underflow[ch]++;
+        f->last = f->size ? (s8)f->samples[f->head] : 0;
+        if (f->size) {
+            f->head = (f->head + 1) & 31u;
+            f->size--;
+        }
+        f->pops++;
+        if (f->size <= 16u) gba_audio_refill(ch);
+    }
+}
+
+static s16 gba_audio_clamp(int sample) {
+    if (sample > 32767) return 32767;
+    if (sample < -32768) return -32768;
+    return (s16)sample;
+}
+
+static void gba_audio_output_cycles(u32 cycles) {
+    gba_audio_cycle_phase += cycles;
+    while (gba_audio_cycle_phase >= GBA_AUDIO_CYCLES_PER_SAMPLE) {
+        gba_audio_cycle_phase -= GBA_AUDIO_CYCLES_PER_SAMPLE;
+        int left = 0, right = 0;
+        if (io_regs[0x084] & 0x80u) { /* SOUNDCNT_X master enable */
+            u16 h = io_read16(0x082);
+            for (int ch = 0; ch < 2; ++ch) {
+                const int sample = (int)gba_sound_fifo[ch].last;
+                const int gain = (h & (1u << (ch + 2))) ? 128 : 64;
+                if (h & (1u << (ch ? 13 : 9))) left += sample * gain;
+                if (h & (1u << (ch ? 12 : 8))) right += sample * gain;
+            }
+        }
+        if (left || right) gba_audio_nonzero++;
+        /* Boot: SOUNDCNT_X often turns on before the first DMA data arrives.
+         * Arm the ramp only once a nonzero sample actually reaches the mixer.
+         * Master-off transitions decay instead of suddenly snapping to zero. */
+        const bool master_on = (io_regs[0x084] & 0x80u) != 0;
+        if (master_on && !gba_audio_master_was_on)
+            gba_audio_wait_for_first_sample = true;
+        if (!master_on && gba_audio_master_was_on)
+            gba_audio_start_ramp();
+        gba_audio_master_was_on = master_on;
+        if (master_on && gba_audio_wait_for_first_sample && (left || right)) {
+            gba_audio_start_ramp();
+            gba_audio_wait_for_first_sample = false;
+        }
+        if (gba_audio_ramp_remaining) {
+            const unsigned old_weight = gba_audio_ramp_remaining;
+            const unsigned new_weight = GBA_AUDIO_DECLICK_SAMPLES - old_weight;
+            left = (gba_audio_ramp_from[0] * (int)old_weight
+                  + left * (int)new_weight) / (int)GBA_AUDIO_DECLICK_SAMPLES;
+            right = (gba_audio_ramp_from[1] * (int)old_weight
+                   + right * (int)new_weight) / (int)GBA_AUDIO_DECLICK_SAMPLES;
+            gba_audio_ramp_remaining--;
+        }
+        gba_audio_previous_pcm[0] = left;
+        gba_audio_previous_pcm[1] = right;
+        unsigned n = gba_audio_pcm_frames++ * 2u;
+        gba_audio_pcm[n] = gba_audio_clamp(left);
+        gba_audio_pcm[n + 1] = gba_audio_clamp(right);
+        gba_audio_diag_note(gba_audio_pcm[n], gba_audio_pcm[n + 1]);
+        gba_audio_frames++;
+        if (gba_audio_pcm_frames == GBA_AUDIO_BLOCK_FRAMES) gba_audio_flush();
+    }
+}
+
+static void gba_audio_flush(void) {
+    if (!gba_audio_pcm_frames) return;
+    gba_audio_diag_write(gba_audio_pcm, gba_audio_pcm_frames);
+    display_audio_submit(gba_audio_pcm, gba_audio_pcm_frames);
+    gba_audio_pcm_frames = 0;
+}
+
+static void gba_audio_report(void) {
+    if (!getenv("GBA_AUDIO_STATS")) return;
+    fprintf(stderr,
+        "[audio] direct-sound: frames=%llu nonzero=%llu "
+        "FIFO-A: writes=%llu pops=%llu refills=%llu; "
+        "FIFO-B: writes=%llu pops=%llu refills=%llu; "
+        "SOUNDCNT_H=%04X SOUNDCNT_X=%04X\n",
+        gba_audio_frames, gba_audio_nonzero,
+        gba_sound_fifo[0].writes, gba_sound_fifo[0].pops, gba_sound_fifo[0].refills,
+        gba_sound_fifo[1].writes, gba_sound_fifo[1].pops, gba_sound_fifo[1].refills,
+        io_read16(0x082), io_read16(0x084));
+    fprintf(stderr, "[audio] MP2K PCM ring wraps=%llu\n",
+            gba_mp2k_pcm_ring_wraps);
+    fprintf(stderr, "[audio] declick: crossfades=%llu length=%u samples (%u ms)\n",
+            gba_audio_ramps, GBA_AUDIO_DECLICK_SAMPLES,
+            (unsigned)(GBA_AUDIO_DECLICK_SAMPLES * 1000u / GBA_AUDIO_HZ));
+}
+
+/* GBA_AUDIO_DIAG_V4 implementation. The captured file is the actual PCM submitted
+ * to SDL, not a re-synthesized song or a copy of the copyrighted ROM data. */
+static void gba_audio_diag_u32(FILE *f, unsigned x) {
+    unsigned char b[4] = {(unsigned char)x, (unsigned char)(x >> 8),
+                          (unsigned char)(x >> 16), (unsigned char)(x >> 24)};
+    fwrite(b, 1, 4, f);
+}
+
+static void gba_audio_diag_init(void) {
+    const char *diag = getenv("GBA_AUDIO_DIAG");
+    gba_audio_diag_enabled = diag && *diag && *diag != '0';
+    gba_audio_diag_period = 0;
+    gba_audio_diag_peak = gba_audio_diag_samples = gba_audio_diag_nonzero = 0;
+    memset(gba_audio_diag_underflow, 0, sizeof gba_audio_diag_underflow);
+    memset(gba_audio_diag_previous_underflow, 0, sizeof gba_audio_diag_previous_underflow);
+    memset(gba_audio_diag_previous_refills, 0, sizeof gba_audio_diag_previous_refills);
+    gba_audio_diag_wav_written = 0;
+    const char *wav = getenv("GBA_AUDIO_WAV");
+    if (!wav || !*wav) return;
+    gba_audio_diag_wav = fopen(wav, "wb");
+    if (!gba_audio_diag_wav) {
+        perror("[audio-diag] Cannot open WAV");
+        return;
+    }
+    fwrite("RIFF", 1, 4, gba_audio_diag_wav);
+    gba_audio_diag_u32(gba_audio_diag_wav, 36);
+    fwrite("WAVEfmt ", 1, 8, gba_audio_diag_wav);
+    gba_audio_diag_u32(gba_audio_diag_wav, 16);
+    { const unsigned char format[4] = {1, 0, 2, 0};
+      fwrite(format, 1, 4, gba_audio_diag_wav); }
+    gba_audio_diag_u32(gba_audio_diag_wav, GBA_AUDIO_HZ);
+    gba_audio_diag_u32(gba_audio_diag_wav, GBA_AUDIO_HZ * 4u);
+    { const unsigned char fmt[4] = {4, 0, 16, 0};
+      fwrite(fmt, 1, 4, gba_audio_diag_wav); }
+    fwrite("data", 1, 4, gba_audio_diag_wav);
+    gba_audio_diag_u32(gba_audio_diag_wav, 0);
+    fprintf(stderr, "[audio-diag] WAV capture: %s (max 20 seconds)\n", wav);
+}
+
+static void gba_audio_diag_note(s16 left, s16 right) {
+    if (!gba_audio_diag_enabled) return;
+    unsigned period = frame_count / 60u;
+    if (period != gba_audio_diag_period) {
+        fprintf(stderr,
+            "[audio-diag] frames=%u..%u mode=%02X stage=%02X "
+            "samples=%u nonzero=%u peak=%u "
+            "FIFO-A-empty=%llu refills=%llu FIFO-B-empty=%llu refills=%llu "
+            "SOUNDCNT_H=%04X X=%04X BIAS=%04X TIMER0=%04X\n",
+            gba_audio_diag_period * 60u, period * 60u,
+            ewram ? ewram[0x10] : 0, ewram ? ewram[0x11] : 0,
+            gba_audio_diag_samples, gba_audio_diag_nonzero, gba_audio_diag_peak,
+            gba_audio_diag_underflow[0] - gba_audio_diag_previous_underflow[0],
+            gba_sound_fifo[0].refills - gba_audio_diag_previous_refills[0],
+            gba_audio_diag_underflow[1] - gba_audio_diag_previous_underflow[1],
+            gba_sound_fifo[1].refills - gba_audio_diag_previous_refills[1],
+            io_read16(0x082), io_read16(0x084), io_read16(0x088),
+            timers[0].counter);
+        for (int ch = 0; ch < 2; ++ch) {
+            gba_audio_diag_previous_underflow[ch] = gba_audio_diag_underflow[ch];
+            gba_audio_diag_previous_refills[ch] = gba_sound_fifo[ch].refills;
+        }
+        gba_audio_diag_period = period;
+        gba_audio_diag_peak = gba_audio_diag_samples = gba_audio_diag_nonzero = 0;
+    }
+    int a = left < 0 ? -(int)left : (int)left;
+    int b = right < 0 ? -(int)right : (int)right;
+    unsigned peak = (unsigned)(a > b ? a : b);
+    if (peak > gba_audio_diag_peak) gba_audio_diag_peak = peak;
+    if (peak) gba_audio_diag_nonzero++;
+    gba_audio_diag_samples++;
+}
+
+static void gba_audio_diag_write(const s16 *samples, unsigned frames) {
+    if (!gba_audio_diag_wav || !frames) return;
+    const unsigned max_frames = GBA_AUDIO_HZ * 20u;
+    if (gba_audio_diag_wav_written >= max_frames) return;
+    if (frames > max_frames - gba_audio_diag_wav_written)
+        frames = max_frames - gba_audio_diag_wav_written;
+    unsigned written = (unsigned)fwrite(samples, 4, frames, gba_audio_diag_wav);
+    gba_audio_diag_wav_written += written;
+}
+
+static void gba_audio_diag_finish(void) {
+    if (gba_audio_diag_enabled)
+        fprintf(stderr,
+            "[audio-diag] final: frame=%u A-empty=%llu B-empty=%llu "
+            "A-refills=%llu B-refills=%llu\n",
+            frame_count, gba_audio_diag_underflow[0],
+            gba_audio_diag_underflow[1],
+            gba_sound_fifo[0].refills, gba_sound_fifo[1].refills);
+    if (!gba_audio_diag_wav) return;
+    unsigned bytes = gba_audio_diag_wav_written * 4u;
+    if (fseek(gba_audio_diag_wav, 4L, SEEK_SET) == 0)
+        gba_audio_diag_u32(gba_audio_diag_wav, 36u + bytes);
+    if (fseek(gba_audio_diag_wav, 40L, SEEK_SET) == 0)
+        gba_audio_diag_u32(gba_audio_diag_wav, bytes);
+    fclose(gba_audio_diag_wav);
+    gba_audio_diag_wav = NULL;
+    fprintf(stderr, "[audio-diag] WAV finalized: %u frames (%.2f s)\n",
+            gba_audio_diag_wav_written,
+            (double)gba_audio_diag_wav_written / GBA_AUDIO_HZ);
+}
+
+/* ---- Interrupt Delivery ---- */
+
+static bool in_irq = false;
+static int g_validating;   /* lockstep validation in progress (see recomp_validate) */
+static void func_ring_dump(void);
+static void hist_dump(void);
+extern int g_hist_on;
+
+static void check_interrupts(void) {
+    /* Inside a handler only if it re-enabled IRQs by clearing CPSR's I bit,
+     * as on hardware. Advance Wars runs its frame from the VBlank handler
+     * with HBlank nested in, for its text-box split. */
+    if (g_validating || (in_irq && (cpsr & 0x80))) return;
+
+    u16 ime = io_read16(0x208);
+    if (!ime) return;
+
+    u16 ie = io_read16(0x200);
+    u16 if_val = io_read16(0x202);
+    u16 pending = ie & if_val;
+    if (!pending) return;
+
+    /* Read handler address from 0x03007FFC (set by game's crt0) */
+    u32 handler_addr = iwram[0x7FFC] | (iwram[0x7FFD] << 8) |
+                       (iwram[0x7FFE] << 16) | (iwram[0x7FFF] << 24);
+    if (handler_addr == 0) return;
+
+    /* IRQ entry: IRQ mode with I set, old CPSR in SPSR */
+    bool was_in_irq = in_irq;
+    u32 saved_cpsr = cpsr, saved_spsr = spsr;
+    spsr = cpu_get_cpsr();
+    cpsr = (cpsr & ~0xFFu) | 0x92u;
+    in_irq = true;
+
+    /* Set BIOS IF flags at 0x03007FF8 (for IntrWait/VBlankIntrWait) */
+    u16 bios_if = iwram[0x7FF8] | (iwram[0x7FF9] << 8);
+    bios_if |= pending;
+    iwram[0x7FF8] = (u8)(bios_if);
+    iwram[0x7FF9] = (u8)(bios_if >> 8);
+
+    /* Save recompiled state (IRQ handler runs with its own context) */
+    u32 saved_r[16];
+    bool saved_N = CPU_N, saved_Z = CPU_Z, saved_C = CPU_C, saved_V = CPU_V;
+    memcpy(saved_r, r, sizeof(r));
+
+    /* Call the handler via BX dispatch. An interrupt lands between two
+     * instructions, so the interrupted code's return tracking is untouched. */
+    u32 saved_ret = g_ret;
+    g_ret = 0;
+    u32 saved_mode = bus_mode;   /* a handler interrupting DMA or a BIOS call */
+    bus_mode = BUS_ROM_CODE;
+    cpu_bx(handler_addr);
+    bus_mode = saved_mode;
+    g_ret = saved_ret;
+
+    /* Restore game state */
+    memcpy(r, saved_r, sizeof(r));
+    CPU_N = saved_N; CPU_Z = saved_Z; CPU_C = saved_C; CPU_V = saved_V;
+    cpsr = saved_cpsr; spsr = saved_spsr;
+
+    in_irq = was_in_irq;
+}
+
+/* ---- Scanline Scheduler ---- */
+
+/* Advance hardware by a number of cycles. This is the heartbeat:
+ * tracks scanlines, fires HBlank/VBlank, triggers DMA, delivers IRQs. */
+static jmp_buf validate_jmp;
+static u32 validate_deadline;
+
+static void advance_cycles(u32 cycles) {
+    cycle_counter += cycles;
+    scanline_cycles += cycles;
+    /* A validated call that runs past its budget (a main loop, a wait on an
+     * interrupt we're holding off) is abandoned, not compared */
+    if (g_validating && (s32)(cycle_counter - validate_deadline) > 0)
+        longjmp(validate_jmp, 1);
+
+    /* Tick timers */
+    timer_tick(cycles);
+
+    /* Two events per line, as on hardware: HBlank at cycle 960 (the line is
+     * drawn, then HBlank DMA/IRQs run with VCOUNT still on that line), and the
+     * line end at 1232 (VCOUNT advances; VBlank and VCount match). An HBlank
+     * handler that reads VCOUNT to set up the next line needs that order.
+     * The state is global because IRQ handlers re-enter advance_cycles. */
+    for (;;) {
+        if (!hblank_done && scanline_cycles >= HBLANK_START_CYCLE) {
+            hblank_done = 1;
+            /* The line just drawn, with the registers as they are now */
+            if (scanline < VISIBLE_SCANLINES && !g_validating)
+                display_render_line((int)scanline);
+            io_write16(0x004, io_read16(0x004) | 2);   /* HBlank flag */
+            /* HBlank IF only when DISPSTAT enables its IRQ (bit 4), as on
+             * hardware: Advance Wars leaves IE's HBlank bit set in battle and
+             * relies on DISPSTAT to keep its map-HUD split handler quiet */
+            if (io_read16(0x004) & 0x10)
+                io_write16(0x202, io_read16(0x202) | 2);
+            if (scanline < VISIBLE_SCANLINES) dma_trigger_hblank();  /* not in VBlank */
+            check_interrupts();
+            continue;
+        }
+        if (scanline_cycles < CYCLES_PER_SCANLINE) break;
+        scanline_cycles -= CYCLES_PER_SCANLINE;
+        hblank_done = 0;
+
+        u32 prev_scanline = scanline;
+        scanline = (scanline + 1) % SCANLINES_PER_FRAME;
+
+        /* Update VCOUNT */
+        io_regs[0x006] = (u8)(scanline & 0xFF);
+        io_regs[0x007] = 0;
+
+        /* Update DISPSTAT */
+        u16 dispstat = io_read16(0x004);
+        u16 vcount_target = (dispstat >> 8) & 0xFF;
+
+        dispstat &= ~0x0007; /* Clear VBlank, HBlank, VCount match */
+        if (scanline >= VISIBLE_SCANLINES)
+            dispstat |= 1; /* VBlank flag */
+        if (scanline == vcount_target)
+            dispstat |= 4; /* VCount match flag */
+        io_write16(0x004, dispstat);
+
+        /* VBlank start (scanline 160) */
+        if (scanline == VISIBLE_SCANLINES && prev_scanline != VISIBLE_SCANLINES) {
+            /* VBlank IF flag is ALWAYS set when VBlank starts.
+             * DISPSTAT bit 3 controls whether the IRQ fires, but IF is
+             * set unconditionally by the hardware. */
+            {
+                u16 if_val = io_read16(0x202);
+                io_write16(0x202, if_val | 1); /* VBlank = bit 0 */
+            }
+
+            /* Trigger VBlank DMA */
+            dma_trigger_vblank();
+
+            /* Render frame and handle input */
+            frame_count++;
+
+            /* Update KEYINPUT from SDL */
+            u16 keys = display_get_keys();
+            io_regs[0x130] = (u8)(keys);
+            io_regs[0x131] = (u8)(keys >> 8);
+
+            if (!g_validating) display_render_frame();  /* never twice per frame */
+
+            /* Frame pacing (headless runs flat out) */
+            display_pace();
+
+            {
+                /* GBA_FUNC_TRACE_AT=N[,N...]: histogram of the functions
+                 * entered between VBlank N and VBlank N+1 */
+                static const char* at = (const char*)1;
+                if (at == (const char*)1) at = getenv("GBA_FUNC_TRACE_AT");
+                if (g_hist_on) hist_dump();
+                for (const char* p = at; p && *p; ) {
+                    if ((u32)atol(p) == frame_count) { g_hist_on = 1; break; }
+                    p = strchr(p, ','); if (p) p++;
+                }
+            }
+
+            /* Memory snapshot for diffing against tools/oracle */
+            {
+                const char* dp = display_dump_path(frame_count);
+                FILE* df = dp ? fopen(dp, "wb") : NULL;
+                if (df) {
+                    fwrite(ewram, 1, 0x40000, df); fwrite(iwram, 1, 0x8000, df);
+                    fwrite(io_regs, 1, 0x400, df); fwrite(palette, 1, 0x400, df);
+                    fwrite(vram, 1, 0x18000, df);  fwrite(oam, 1, 0x400, df);
+                    fclose(df);
+                }
+            }
+
+            /* Debug status */
+            long log_every = display_log_every();
+            if (frame_count <= 5 || (log_every && frame_count % log_every == 0)) {
+                u16 dispcnt = io_read16(0x000);
+                fprintf(stderr, "[frame %u] DISPCNT=0x%04X mode=%d BG=%d%d%d%d OBJ=%d "
+                        "BLDCNT=0x%04X BLDY=%u pal0=0x%04X pal1=0x%04X\n",
+                        frame_count, dispcnt, dispcnt & 7,
+                        (dispcnt >> 8) & 1, (dispcnt >> 9) & 1,
+                        (dispcnt >> 10) & 1, (dispcnt >> 11) & 1,
+                        (dispcnt >> 12) & 1, io_read16(0x050), io_read16(0x054) & 31,
+                        palette[0] | (palette[1] << 8), palette[2] | (palette[3] << 8));
+                fflush(stderr);
+            }
+        }
+
+        /* VCount match IF, only when DISPSTAT enables its IRQ (bit 5) */
+        if (scanline == vcount_target && (dispstat & 0x20)) {
+            u16 if_val = io_read16(0x202);
+            io_write16(0x202, if_val | 4); /* VCount = bit 2 */
+        }
+
+        /* Check for interrupts at each line start */
+        check_interrupts();
+    }
+
+    /* Periodically poll SDL events */
+    if (cycle_counter - last_poll_cycle > POLL_INTERVAL) {
+        last_poll_cycle = cycle_counter;
+        if (display_poll_events()) {
+            gba_shutdown();
+            exit(0);
+        }
+    }
+}
+
+/* Cycles for one data access, by region, as on hardware: 16-bit buses
+ * (EWRAM, ROM, palette/VRAM) take two accesses for a word. Cartridge waits
+ * come from WAITCNT (WS0 for all ROM mirrors, SRAM from bits 0-1). */
+static u32 access_cycles(u32 addr, int wide) {
+    static const u8 nwait[4] = { 4, 3, 2, 8 };
+    switch (addr >> 24) {
+    case 0x02: return wide ? 6 : 3;
+    case 0x05: case 0x06: return wide ? 2 : 1;
+    case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D: {
+        u16 w = io_regs[0x204] | (io_regs[0x205] << 8);
+        u32 n = 1 + nwait[(w >> 2) & 3], s = (w & 0x10) ? 2 : 3;
+        return wide ? n + s : n;
+    }
+    case 0x0E: case 0x0F:
+        return 1 + nwait[(io_regs[0x204] | (io_regs[0x205] << 8)) & 3];
+    default: return 1;   /* BIOS, IWRAM, I/O, OAM */
+    }
+}
+
+/* A data access as mGBA times it (src/gba/memory.c, GBAMemoryStall). Code
+ * running from ROM with the prefetch buffer on (WAITCNT bit 14) overlaps a
+ * RAM or I/O access with prefetching, so it costs nothing beyond the
+ * opcode; a cartridge access (ROM, SRAM) costs its waits, a load's internal
+ * cycle, and the nonsequential fetch after it. The HLE BIOS's loops see the
+ * same overlap without the opcode around it: 2 cycles back per access.
+ * Interpreted RAM code pays the access plus the internal cycle; DMA just
+ * the access. */
+static s32 cycle_credit;
+
+static void charge(s32 c) {
+    c += cycle_credit;
+    cycle_credit = c < 0 ? c : 0;
+    if (c > 0) advance_cycles((u32)c);
+}
+
+/* While a line is drawn, the CPU waits for a VRAM slot the background
+ * fetches leave free (mGBA's GBAMemoryStallVRAM): each enabled layer takes
+ * slots in a 32-cycle pattern. A word needs two slots. Only CPU code pays
+ * it; mGBA's DMA and HLE BIOS don't, and the prefetcher hides it from ROM
+ * code. */
+static u32 vram_stall(u32 addr, int wide) {
+#define VS_T4(x) (0x011u << (x))
+#define VS_T8(x) (0x010u << (x))
+#define VS_A2 0x100u
+#define VS_A3 0x200u
+#define VS_B  0x400u
+    static const u16 lut[32] = {
+        VS_T4(0) | VS_A3, VS_T4(1) | VS_A3, VS_T4(2) | VS_A2, VS_T4(3) | VS_A2 | VS_B,
+        VS_T4(0) | VS_A3, VS_T4(1) | VS_A3, VS_T4(2) | VS_A2, VS_T4(3) | VS_A2 | VS_B,
+        VS_A3, VS_A3, VS_A2, VS_A2 | VS_B,
+        VS_T8(0) | VS_A3, VS_T8(1) | VS_A3, VS_T8(2) | VS_A2, VS_T8(3) | VS_A2 | VS_B,
+        VS_A3, VS_A3, VS_A2, VS_A2 | VS_B,
+        VS_T4(0) | VS_A3, VS_T4(1) | VS_A3, VS_T4(2) | VS_A2, VS_T4(3) | VS_A2 | VS_B,
+        VS_A3, VS_A3, VS_A2, VS_A2 | VS_B,
+        VS_T8(0) | VS_A3, VS_T8(1) | VS_A3, VS_T8(2) | VS_A2, VS_T8(3) | VS_A2 | VS_B,
+    };
+    enum { HDRAW = 1008 };   /* mGBA's draw period; its HBlank starts here */
+    if ((addr >> 24) != 0x06 || vram_burst || scanline >= VISIBLE_SCANLINES || scanline_cycles >= HDRAW) return 0;
+    u16 dispcnt = io_read16(0x000);
+    u32 mode = dispcnt & 7, mask = 0;
+    if ((dispcnt & 0x80) || (addr & 0x1FFFF) >= (mode >= 3 ? 0x14000u : 0x10000u)) return 0;
+    if (mode <= 1)
+        for (u32 i = 0; i < (mode ? 2u : 4u); i++)
+            if (dispcnt & (0x100 << i))
+                mask |= (io_read16(0x008 + 2 * i) & 0x80) ? VS_T8(i) : VS_T4(i);
+    if (mode == 1 && (dispcnt & 0x400)) mask |= VS_A2;
+    if (mode == 2) mask |= ((dispcnt & 0x400) ? VS_A2 : 0) | ((dispcnt & 0x800) ? VS_A3 : 0);
+    if (mode >= 3 && mode <= 5 && (dispcnt & 0x400)) mask |= VS_B;
+    if (!mask) return 0;
+    s32 until = HDRAW - (s32)scanline_cycles, stall = until, extra = wide;
+    for (s32 i = 0; i < 16; i++)
+        if (!(lut[(-until + i) & 31] & mask) && !extra--) { stall = i; break; }
+    stall -= wide;   /* a word's second half is already in its access time */
+    return stall > 0 ? (u32)stall : 0;
+#undef VS_T4
+#undef VS_T8
+#undef VS_A2
+#undef VS_A3
+#undef VS_B
+}
+
+static s32 data_cycles(u32 addr, int wide, int load) {
+    bool cart = addr >= 0x08000000u;
+    switch (bus_mode) {
+    case BUS_ROM_CODE:
+        if (!(io_regs[0x205] & 0x40)) return access_cycles(addr, wide) + load + 2 + vram_stall(addr, wide);
+        return cart ? (s32)access_cycles(addr, wide) + load + 2 : 0;
+    case BUS_BIOS_HLE:
+        return cart ? (s32)access_cycles(addr, wide) + load : -2;
+    case BUS_RAM_CODE: return access_cycles(addr, wide) + load + vram_stall(addr, wide);
+    default:           return access_cycles(addr, wide);
+    }
+}
+
+/* Opcode time, charged by the generated code at each block start: a 16-bit
+ * fetch is 1 cycle plus the cartridge's sequential wait (an ARM opcode is
+ * two). Taken branches refill the pipeline, about one fetch pair per block
+ * on average. GBA_FETCH_X16 scales it (16 = as modelled) to calibrate
+ * against tools/oracle. */
+void cpu_fetches(u32 n) {
+    static u32 x16, frac;
+    if (!x16) { const char* e = getenv("GBA_FETCH_X16"); x16 = e ? (u32)atoi(e) : 16; }
+    u16 w = io_regs[0x204] | (io_regs[0x205] << 8);
+    frac += n * x16 * ((w & 0x10) ? 2u : 3u);
+    charge((s32)(frac >> 4));
+    frac &= 15;
+}
+
+/* ---- I/O Write Hook ---- */
+
+/* Dispatches side effects when the game writes to I/O registers. */
+static void io_write_hook(u32 offset, u32 value, int size) {
+    (void)value;
+
+    /* SOUNDCNT_H FIFO resets are write-only, self-clearing bits. */
+    if (offset == 0x083u || (offset == 0x082u && size >= 2)) {
+        u16 soundcnt = io_read16(0x082);
+        if (soundcnt & 0x0800u) gba_audio_fifo_reset(0);
+        if (soundcnt & 0x8000u) gba_audio_fifo_reset(1);
+        io_write16(0x082, soundcnt & ~0x8800u);
+    }
+
+    /* DMA control writes */
+    for (int ch = 0; ch < 4; ch++) {
+        u32 cnt_hi_off = DMA_CNT_H(ch);
+        if (offset == cnt_hi_off || offset == cnt_hi_off + 1) {
+            u16 cnt_hi = io_read16(cnt_hi_off);
+            if (cnt_hi & (1 << 15)) {
+                dma_enable(ch);
+                dma_execute(ch);
+            }
+        }
+    }
+
+    /* Timer control writes */
+    for (int t = 0; t < 4; t++) {
+        if (offset == TIMER_CNT_L(t) || offset == TIMER_CNT_L(t) + 1) {
+            /* Write to CNT_L sets the reload value (not the running counter) */
+            timers[t].reload = io_read16(TIMER_CNT_L(t));
+        }
+        if (offset == TIMER_CNT_H(t) || offset == TIMER_CNT_H(t) + 1) {
+            timer_write_control(t, io_read16(TIMER_CNT_H(t)));
+        }
+    }
+
+    /* IF register write: writing 1 bits CLEARS them (acknowledge) */
+    if (offset == 0x202 || offset == 0x203) {
+        /* The game wrote to IF - but GBA IF is write-1-to-clear.
+         * We need to read what was written and clear those bits from the
+         * actual IF value. The write already happened to io_regs, so we
+         * need to undo it and apply the clear semantics. */
+        /* This is handled specially in bus_write16 for I/O region */
+    }
+
+    /* HALTCNT write (0x04000301) - power down / halt */
+    if (offset == 0x301) {
+        /* Halt: advance to next interrupt */
+        /* In recompiled code, just advance a frame */
+    }
+
+    /* SIOCNT write (0x04000128) - if the multiplayer start bit (bit 7)
+     * goes high, simulate a transfer with no slaves connected:
+     *   - SIOMULTI[0] = whatever the parent put in SIOMLT_SEND
+     *   - SIOMULTI[1..3] = 0xFFFF (idle, no slave)
+     *   - SD bit (bit 3) stays as the game wrote it (we OR it high on
+     *     read elsewhere)
+     *   - Error bit (bit 6) = 1 (no slaves found - one common interpretation
+     *     used by games as a "running solo" signal)
+     *   - Start bit (bit 7) cleared (transfer complete)
+     *   - If IRQ enable (bit 14) set, raise IF bit 7 (SIO IRQ) */
+    if (offset == 0x128 || offset == 0x129) {
+        u16 siocnt = io_read16(0x128);
+        if (siocnt & 0x80) {
+            /* Transfer initiated */
+            u16 sio_send = io_read16(0x12A);
+            io_write16(0x120, sio_send);    /* SIOMULTI[0] = sent value */
+            io_write16(0x122, 0xFFFF);      /* SIOMULTI[1] = idle */
+            io_write16(0x124, 0xFFFF);      /* SIOMULTI[2] = idle */
+            io_write16(0x126, 0xFFFF);      /* SIOMULTI[3] = idle */
+            /* Clear start, set error (no slaves) */
+            siocnt = (siocnt & ~0x80) | 0x40;
+            io_write16(0x128, siocnt);
+            /* Raise SIO IRQ if enabled */
+            if (siocnt & 0x4000) {
+                u16 if_val = io_read16(0x202);
+                io_write16(0x202, if_val | 0x80);
+                /* Also set BIOS IF mirror for IntrWait */
+                u16 bios_if = iwram[0x7FF8] | (iwram[0x7FF9] << 8);
+                bios_if |= 0x80;
+                iwram[0x7FF8] = (u8)(bios_if);
+                iwram[0x7FF9] = (u8)(bios_if >> 8);
+            }
+        }
+    }
+}
+
+/* ---- Memory Bus Implementation ---- */
+
+static inline void mem_write8(u8* mem, u32 off, u8 val) { mem[off] = val; }
+
+static inline void mem_write16_raw(u8* mem, u32 off, u16 val) {
+    mem[off]   = (u8)(val);
+    mem[off+1] = (u8)(val >> 8);
+}
+
+static inline void mem_write32_raw(u8* mem, u32 off, u32 val) {
+    mem[off]   = (u8)(val);
+    mem[off+1] = (u8)(val >> 8);
+    mem[off+2] = (u8)(val >> 16);
+    mem[off+3] = (u8)(val >> 24);
+}
+
+static u32 read32_(u32 addr);
+u32 bus_read32(u32 addr) { charge(data_cycles(addr, 1, 1)); return read32_(addr); }
+
+static u32 read32_(u32 addr) {
+    addr &= ~3u;
+    u32 region = addr >> 24;
+    u32 offset;
+
+    switch (region) {
+    case 0x00:
+        offset = addr & 0x3FFF;
+        if (bios_mem) {
+            return bios_mem[offset] | (bios_mem[offset+1] << 8) |
+                   (bios_mem[offset+2] << 16) | (bios_mem[offset+3] << 24);
+        }
+        return 0;
+
+    case 0x02:
+        offset = addr & 0x3FFFF;
+        return ewram[offset] | (ewram[offset+1] << 8) |
+               (ewram[offset+2] << 16) | (ewram[offset+3] << 24);
+
+    case 0x03:
+        offset = addr & 0x7FFF;
+        return iwram[offset] | (iwram[offset+1] << 8) |
+               (iwram[offset+2] << 16) | (iwram[offset+3] << 24);
+
+    case 0x04: {
+        offset = addr & 0x3FF;
+        /* Timer counter reads return the running counter, not the reload */
+        for (int t = 0; t < 4; t++) {
+            if (offset == (u32)TIMER_CNT_L(t)) {
+                u16 cnt = timers[t].running ? timers[t].counter : timers[t].reload;
+                u16 ctl = timers[t].control;
+                return (u32)cnt | ((u32)ctl << 16);
+            }
+        }
+        return io_regs[offset] | (io_regs[offset+1] << 8) |
+               (io_regs[offset+2] << 16) | (io_regs[offset+3] << 24);
+    }
+
+    case 0x05:
+        offset = addr & 0x3FF;
+        return palette[offset] | (palette[offset+1] << 8) |
+               (palette[offset+2] << 16) | (palette[offset+3] << 24);
+
+    case 0x06:
+        offset = addr & 0x1FFFF;
+        if (offset >= 0x18000) offset -= 0x8000;
+        return vram[offset] | (vram[offset+1] << 8) |
+               (vram[offset+2] << 16) | (vram[offset+3] << 24);
+
+    case 0x07:
+        offset = addr & 0x3FF;
+        return oam[offset] | (oam[offset+1] << 8) |
+               (oam[offset+2] << 16) | (oam[offset+3] << 24);
+
+    case 0x08: case 0x09:
+    case 0x0A: case 0x0B:
+    case 0x0C: case 0x0D: {
+        if (is_eeprom_addr(addr)) {
+            u16 v = eeprom_read();
+            return v | ((u32)eeprom_read() << 16);
+        }
+        offset = (addr - 0x08000000) % rom_size;
+        return rom_data[offset] | (rom_data[offset+1] << 8) |
+               (rom_data[offset+2] << 16) | (rom_data[offset+3] << 24);
+    }
+
+    case 0x0E: case 0x0F:
+        if (sram) {
+            u8 val = backup_read8(addr);
+            return val | (val << 8) | (val << 16) | (val << 24);
+        }
+        return 0;
+
+    default:
+        return 0;
+    }
+}
+
+u32 bus_read32s(u32 addr) { charge(data_cycles(addr, 1, 0)); return read32_(addr); }
+
+static u16 read16_(u32 addr);
+u16 bus_read16(u32 addr) { charge(data_cycles(addr, 0, 1)); return read16_(addr); }
+
+static u16 read16_(u32 addr) {
+    addr &= ~1u;
+    u32 region = addr >> 24;
+    u32 offset;
+
+    switch (region) {
+    case 0x02: offset = addr & 0x3FFFF;  return ewram[offset] | (ewram[offset+1] << 8);
+    case 0x03: offset = addr & 0x7FFF;   return iwram[offset] | (iwram[offset+1] << 8);
+    case 0x04: {
+        offset = addr & 0x3FF;
+        /* Timer counter reads */
+        for (int t = 0; t < 4; t++) {
+            if (offset == (u32)TIMER_CNT_L(t))
+                return timers[t].running ? timers[t].counter : timers[t].reload;
+            if (offset == (u32)TIMER_CNT_H(t))
+                return timers[t].control;
+        }
+        return io_regs[offset] | (io_regs[offset+1] << 8);
+    }
+    case 0x05: offset = addr & 0x3FF;    return palette[offset] | (palette[offset+1] << 8);
+    case 0x06:
+        offset = addr & 0x1FFFF;
+        if (offset >= 0x18000) offset -= 0x8000;
+        return vram[offset] | (vram[offset+1] << 8);
+    case 0x07: offset = addr & 0x3FF;    return oam[offset] | (oam[offset+1] << 8);
+    case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D:
+        if (is_eeprom_addr(addr)) return eeprom_read();
+        offset = (addr - 0x08000000) % rom_size;
+        return rom_data[offset] | (rom_data[offset+1] << 8);
+    case 0x0E: case 0x0F: {
+        u8 v = sram ? backup_read8(addr) : 0;
+        return v * 0x0101u;
+    }
+    default: return 0;
+    }
+}
+
+static u8 read8_(u32 addr);
+u8 bus_read8(u32 addr) { charge(data_cycles(addr, 0, 1)); return read8_(addr); }
+
+static u8 read8_(u32 addr) {
+    u32 region = addr >> 24;
+    u32 offset;
+
+    switch (region) {
+    case 0x02: return ewram[addr & 0x3FFFF];
+    case 0x03: return iwram[addr & 0x7FFF];
+    case 0x04: return io_regs[addr & 0x3FF];
+    case 0x05: return palette[addr & 0x3FF];
+    case 0x06:
+        offset = addr & 0x1FFFF;
+        if (offset >= 0x18000) offset -= 0x8000;
+        return vram[offset];
+    case 0x07: return oam[addr & 0x3FF];
+    case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D:
+        if (is_eeprom_addr(addr)) return (u8)eeprom_read();
+        offset = (addr - 0x08000000) % rom_size;
+        return rom_data[offset];
+    case 0x0E: case 0x0F:
+        return sram ? backup_read8(addr) : 0;
+    default: return 0;
+    }
+}
+
+/* GBA_WATCH=addr (hex): log every write to that 32-bit word with the
+ * frame, value and the function that made it (most recent RECOMP_ENTER),
+ * a watchpoint for "who changed this" questions. */
+static u32 watch_addr = 1;   /* 1 = not read yet */
+static void watch_check(u32 addr, u32 value, int size) {
+    if (watch_addr == 1) {
+        const char* w = getenv("GBA_WATCH");
+        watch_addr = w ? ((u32)strtoul(w, NULL, 16) & ~3u) : 0;
+    }
+    if (!watch_addr || (addr & ~3u) != watch_addr) return;
+    fprintf(stderr, "[watch] frame %u: write%d [%08X] = %08X in func_%08X (r14=%08X)%s\n",
+            frame_count, size * 8, addr, value, g_func_ring[(g_func_ring_i - 1) & 4095], r[14],
+            in_irq ? " [irq]" : "");
+}
+
+static void bus_write32_(u32 addr, u32 value) {
+    watch_check(addr, value, 4);
+    addr &= ~3u;
+    u32 region = addr >> 24;
+
+    switch (region) {
+    case 0x02: mem_write32_raw(ewram, addr & 0x3FFFF, value); break;
+    case 0x03: mem_write32_raw(iwram, addr & 0x7FFF, value); break;
+    case 0x04: {
+        u32 off = addr & 0x3FF;
+        if (off == 0x0A0u || off == 0x0A4u) {
+            gba_audio_fifo_write(off, value, 4);
+            break;
+        }
+        /* IF register: write-1-to-clear semantics */
+        if (off == 0x200) {
+            /* Lower 16 bits = IE (normal write), upper 16 bits = IF (write-1-to-clear) */
+            mem_write16_raw(io_regs, 0x200, (u16)value); /* IE */
+            u16 if_clear = (u16)(value >> 16);
+            u16 if_val = io_read16(0x202);
+            io_write16(0x202, if_val & ~if_clear);
+        } else {
+            mem_write32_raw(io_regs, off, value);
+            io_write_hook(off, value, 4);
+            io_write_hook(off + 2, value >> 16, 4);
+        }
+        break;
+    }
+    case 0x05: mem_write32_raw(palette, addr & 0x3FF, value); break;
+    case 0x06: {
+        u32 offset = addr & 0x1FFFF;
+        if (offset >= 0x18000) offset -= 0x8000;
+        mem_write32_raw(vram, offset, value);
+        break;
+    }
+    case 0x07: mem_write32_raw(oam, addr & 0x3FF, value); break;
+    case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D:
+        if (is_eeprom_addr(addr)) { eeprom_write((u16)value); eeprom_write((u16)(value >> 16)); }
+        break;
+    case 0x0E: case 0x0F:
+        if (sram) backup_write8(addr, (u8)value);
+        break;
+    default: break;
+    }
+}
+
+static void bus_write16_(u32 addr, u16 value) {
+    watch_check(addr, value, 2);
+    addr &= ~1u;
+    u32 region = addr >> 24;
+
+    switch (region) {
+    case 0x02: mem_write16_raw(ewram, addr & 0x3FFFF, value); break;
+    case 0x03: mem_write16_raw(iwram, addr & 0x7FFF, value); break;
+    case 0x04: {
+        u32 off = addr & 0x3FF;
+        if (off >= 0x0A0u && off <= 0x0A6u) {
+            gba_audio_fifo_write(off, value, 2);
+            break;
+        }
+        /* IF register: write-1-to-clear */
+        if (off == 0x202) {
+            u16 if_val = io_read16(0x202);
+            io_write16(0x202, if_val & ~value);
+        } else {
+            mem_write16_raw(io_regs, off, value);
+            io_write_hook(off, value, 2);
+        }
+        break;
+    }
+    case 0x05: mem_write16_raw(palette, addr & 0x3FF, value); break;
+    case 0x06: {
+        u32 offset = addr & 0x1FFFF;
+        if (offset >= 0x18000) offset -= 0x8000;
+        mem_write16_raw(vram, offset, value);
+        break;
+    }
+    case 0x07: mem_write16_raw(oam, addr & 0x3FF, value); break;
+    case 0x08: case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D:
+        if (is_eeprom_addr(addr)) eeprom_write(value);
+        break;
+    case 0x0E: case 0x0F:
+        if (sram) backup_write8(addr, (u8)value);
+        break;
+    default: break;
+    }
+}
+
+static void bus_write8_(u32 addr, u8 value) {
+    watch_check(addr, value, 1);
+    u32 region = addr >> 24;
+
+    switch (region) {
+    case 0x02: ewram[addr & 0x3FFFF] = value; break;
+    case 0x03: iwram[addr & 0x7FFF] = value; break;
+    case 0x04: {
+        u32 off = addr & 0x3FF;
+        if (off >= 0x0A0u && off <= 0x0A7u) {
+            gba_audio_fifo_write(off, value, 1);
+            break;
+        }
+        /* IF byte write: write-1-to-clear */
+        if (off == 0x202 || off == 0x203) {
+            u16 if_val = io_read16(0x202);
+            if (off == 0x202)
+                io_write16(0x202, if_val & ~(u16)value);
+            else
+                io_write16(0x202, if_val & ~((u16)value << 8));
+        } else {
+            io_regs[off] = value;
+            io_write_hook(off, value, 1);
+        }
+        break;
+    }
+    case 0x05: {
+        u32 offset = addr & 0x3FE;
+        palette[offset] = value;
+        palette[offset+1] = value;
+        break;
+    }
+    case 0x06: {
+        u32 offset = addr & 0x1FFFE;
+        if (offset >= 0x18000) offset -= 0x8000;
+        vram[offset] = value;
+        vram[offset+1] = value;
+        break;
+    }
+    case 0x0E: case 0x0F:
+        if (sram) backup_write8(addr, value);
+        break;
+    default: break;
+    }
+}
+
+void bus_write32(u32 addr, u32 value) { bus_write32_(addr, value); charge(data_cycles(addr, 1, 0)); }
+void bus_write16(u32 addr, u16 value) { bus_write16_(addr, value); charge(data_cycles(addr, 0, 0)); }
+void bus_write8(u32 addr, u8 value)   { bus_write8_(addr, value);  charge(data_cycles(addr, 0, 0)); }
+
+/* ---- CPSR/SPSR ---- */
+
+u32 cpu_get_cpsr(void) {
+    u32 flags = 0;
+    if (CPU_N) flags |= (1u << 31);
+    if (CPU_Z) flags |= (1u << 30);
+    if (CPU_C) flags |= (1u << 29);
+    if (CPU_V) flags |= (1u << 28);
+    return flags | (cpsr & 0x0FFFFFFF);
+}
+
+void cpu_set_cpsr(u32 value, u32 mask) {
+    if (mask & 8) {
+        CPU_N = (value >> 31) & 1;
+        CPU_Z = (value >> 30) & 1;
+        CPU_C = (value >> 29) & 1;
+        CPU_V = (value >> 28) & 1;
+    }
+    if (mask & 1) {
+        cpsr = (cpsr & ~0xFF) | (value & 0xFF);
+    }
+}
+
+u32 cpu_get_spsr(void) { return spsr; }
+
+void cpu_set_spsr(u32 value, u32 mask) {
+    if (mask & 8) spsr = (spsr & 0x0FFFFFFF) | (value & 0xF0000000);
+    if (mask & 1) spsr = (spsr & ~0xFF) | (value & 0xFF);
+}
+
+/* ---- Software Interrupts (BIOS HLE) ---- */
+
+/* Time the BIOS takes, from mGBA's HLE BIOS (src/gba/bios.c): the call and
+ * return cost the same for every SWI but the waits, plus each routine's own
+ * loop; the routines' memory accesses charge themselves */
+static int clz32_(u32 v) { int n = 0; if (!v) return 32; while (!(v & 0x80000000u)) { v <<= 1; n++; } return n; }
+static void div_cycles(s32 num, s32 den) {
+    int loops = clz32_((u32)den) - clz32_((u32)num);
+    advance_cycles(4 + 13 * (loops < 1 ? 1 : loops) + 7);
+}
+
+static void gba_swi_(u32 number);
+void gba_swi(u32 number) {
+    {
+        /* GBA_SWI_LOG=from,to: each SWI in those frames with its scanline,
+         * to line up with tools/oracle's ORACLE_SWI when timing drifts */
+        static long from = -2, to = -1;
+        if (from == -2) {
+            const char* e = getenv("GBA_SWI_LOG");
+            from = -1;
+            if (e) sscanf(e, "%ld,%ld", &from, &to);
+        }
+        if ((long)frame_count >= from && (long)frame_count <= to)
+            fprintf(stderr, "SWI %02X f=%u v=%u c=%u r0=%08X r1=%08X r2=%08X lr=%08X\n",
+                    number, frame_count, scanline, cycle_counter, r[0], r[1], r[2], r[14]);
+    }
+    if (number == 0x00 || number == 0x02 || number == 0x04 || number == 0x05) {
+        gba_swi_(number);
+        return;
+    }
+    /* call and return: 45 + N + (N + S) */
+    u16 w = io_regs[0x204] | (io_regs[0x205] << 8);
+    advance_cycles(45 + 2 * (access_cycles(0x08000000u, 0) - 1) + ((w & 0x10) ? 1 : 2));
+    /* CpuSet and CpuFastSet run as BIOS code (mGBA doesn't HLE them) */
+    u32 saved_mode = bus_mode;
+    bus_mode = (number == 0x0B || number == 0x0C) ? BUS_RAM_CODE : BUS_BIOS_HLE;
+    gba_swi_(number);
+    bus_mode = saved_mode;
+}
+
+static void gba_swi_(u32 number) {
+    switch (number) {
+    case 0x00: /* SoftReset */
+        memset(iwram + 0x7E00, 0, 0x200);
+        memset(r, 0, sizeof(r));
+        r[13] = 0x03007F00;
+        r[15] = 0x08000000;
+        cpsr = 0x0000001F;
+        /* On real GBA, SoftReset jumps to ROM entry. In recompiled code,
+         * longjmp back to the game_entry() caller to restart cleanly. */
+        if (soft_reset_jmp_valid) {
+            longjmp(soft_reset_jmp, 1);
+        }
+        break;
+
+    case 0x01: { /* RegisterRamReset */
+        u32 flags = r[0];
+        if (flags & 0x01) memset(ewram, 0, 0x40000);
+        if (flags & 0x02) memset(iwram, 0, 0x7E00); /* Preserve top 0x200 */
+        if (flags & 0x04) memset(palette, 0, 0x400);
+        if (flags & 0x08) memset(vram, 0, 0x18000);
+        if (flags & 0x10) memset(oam, 0, 0x400);
+        /* bits 5-7: SIO, sound, other registers */
+        break;
+    }
+
+    case 0x02: /* Halt */
+        /* Advance to next interrupt event */
+        advance_cycles(CYCLES_PER_SCANLINE);
+        break;
+
+    case 0x04: { /* IntrWait */
+        bool discard = r[0] != 0;
+        u16 wait_flags = (u16)r[1];
+
+        if (discard) {
+            /* Clear the BIOS IF flags we're waiting for */
+            u16 bios_if = iwram[0x7FF8] | (iwram[0x7FF9] << 8);
+            bios_if &= ~wait_flags;
+            iwram[0x7FF8] = (u8)(bios_if);
+            iwram[0x7FF9] = (u8)(bios_if >> 8);
+        }
+
+        /* Spin until the requested interrupt fires */
+        int safety = 0;
+        while (safety < SCANLINES_PER_FRAME * 2) {
+            advance_cycles(CYCLES_PER_SCANLINE);
+            safety++;
+            u16 bios_if = iwram[0x7FF8] | (iwram[0x7FF9] << 8);
+            if (bios_if & wait_flags) break;
+        }
+        break;
+    }
+
+    case 0x05: /* VBlankIntrWait */
+        r[0] = 1;
+        r[1] = 1;
+        gba_swi(0x04);
+        break;
+
+    case 0x06: { /* Div: r0/r1 */
+        s32 num = (s32)r[0];
+        s32 den = (s32)r[1];
+        if (den != 0) {
+            r[0] = (u32)(num / den);
+            r[1] = (u32)(num % den);
+            s32 abs_result = (s32)r[0];
+            if (abs_result < 0) abs_result = -abs_result;
+            r[3] = (u32)abs_result;
+        }
+        div_cycles(num, den);
+        break;
+    }
+
+    case 0x07: { /* DivArm: r1/r0 */
+        s32 den = (s32)r[0];
+        s32 num = (s32)r[1];
+        if (den != 0) {
+            r[0] = (u32)(num / den);
+            r[1] = (u32)(num % den);
+            s32 abs_result = (s32)r[0];
+            if (abs_result < 0) abs_result = -abs_result;
+            r[3] = (u32)abs_result;
+        }
+        div_cycles(num, den);
+        break;
+    }
+
+    case 0x08: { /* Sqrt */
+        u32 val = r[0];
+        u32 result = 0;
+        u32 bit = 1u << 30;
+        while (bit > val) bit >>= 2;
+        while (bit != 0) {
+            if (val >= result + bit) {
+                val -= result + bit;
+                result = (result >> 1) + bit;
+            } else {
+                result >>= 1;
+            }
+            bit >>= 2;
+        }
+        r[0] = result;
+        break;
+    }
+
+    case 0x09: { /* ArcTan */
+        /* Approximation: atan(r0) where r0 is 1.14 fixed-point */
+        s32 a = (s32)(s16)r[0];
+        s32 result = a - (a * a * a / 3) / (1 << 28);
+        r[0] = (u32)(s16)result;
+        break;
+    }
+
+    case 0x0A: { /* ArcTan2 */
+        /* Two-argument arctangent, returns angle in [0, 0xFFFF] */
+        s16 x = (s16)r[0];
+        s16 y = (s16)r[1];
+        /* Simple approximation using atan2 */
+        if (x == 0 && y == 0) {
+            r[0] = 0;
+        } else {
+            double angle = atan2((double)y, (double)x);
+            /* Convert from [-pi, pi] to [0, 0xFFFF] */
+            double normalized = angle / (2.0 * 3.14159265358979323846) + 0.5;
+            if (normalized < 0) normalized += 1.0;
+            if (normalized >= 1.0) normalized -= 1.0;
+            r[0] = (u32)(u16)(normalized * 65536.0);
+        }
+        break;
+    }
+
+    case 0x0B: /* CpuSet */
+    case 0x0C: { /* CpuFastSet */
+        u32 src = r[0];
+        u32 dst = r[1];
+        u32 cnt = r[2];
+        u32 count = cnt & 0x1FFFFF;
+        bool fill = (cnt >> 24) & 1;
+        bool word = (number == 0x0C) || ((cnt >> 26) & 1);
+
+        /* CpuFastSet always works in 32-byte chunks */
+        if (number == 0x0C) {
+            count = (count + 7) & ~7u; /* Round up to multiple of 8 */
+        }
+
+        if (word) {
+            u32 fill_val = bus_read32(src);
+            for (u32 i = 0; i < count; i++) {
+                /* CpuFastSet moves 8 words per LDMIA/STMIA: one internal
+                 * cycle and one VRAM stall per burst */
+                bool burst = number == 0x0C && (i & 7);
+                u32 val = fill ? fill_val : burst ? bus_read32s(src + i * 4) : bus_read32(src + i * 4);
+                vram_burst = burst;
+                bus_write32(dst + i * 4, val);
+                vram_burst = false;
+                if (number == 0x0B) advance_cycles(4);
+                else if ((i & 7) == 7) advance_cycles(5);   /* BIOS loop per 8 words */
+            }
+        } else {
+            u16 fill_val = bus_read16(src);
+            for (u32 i = 0; i < count; i++) {
+                u16 val = fill ? fill_val : bus_read16(src + i * 2);
+                bus_write16(dst + i * 2, val);
+                advance_cycles(4);
+            }
+        }
+        break;
+    }
+
+    /* BgAffineSet / ObjAffineSet, as mGBA's HLE BIOS computes them (the
+     * oracle's reference): scale is 8.8 and multiplies the matrix directly,
+     * and only the angle's high byte counts. */
+    case 0x0E: { /* BgAffineSet */
+        u32 src = r[0], dst = r[1];
+        for (u32 i = 0; i < r[2]; i++, src += 20, dst += 16) {
+            float ox = (s32)bus_read32(src) / 256.f, oy = (s32)bus_read32(src + 4) / 256.f;
+            float cx = (s16)bus_read16(src + 8), cy = (s16)bus_read16(src + 10);
+            float sx = (s16)bus_read16(src + 12) / 256.f, sy = (s16)bus_read16(src + 14) / 256.f;
+            float th = (bus_read16(src + 16) >> 8) / 128.f * 3.14159265f;
+            float a = cosf(th) * sx, b = -sinf(th) * sx, c = sinf(th) * sy, d = cosf(th) * sy;
+            bus_write16(dst, (u16)(s16)(a * 256));
+            bus_write16(dst + 2, (u16)(s16)(b * 256));
+            bus_write16(dst + 4, (u16)(s16)(c * 256));
+            bus_write16(dst + 6, (u16)(s16)(d * 256));
+            bus_write32(dst + 8, (u32)(s32)((ox - (a * cx + b * cy)) * 256));
+            bus_write32(dst + 12, (u32)(s32)((oy - (c * cx + d * cy)) * 256));
+        }
+        break;
+    }
+
+    case 0x0F: { /* ObjAffineSet; r3 = stride between PA, PB, PC, PD */
+        u32 src = r[0], dst = r[1], stride = r[3];
+        for (u32 i = 0; i < r[2]; i++, src += 8, dst += stride * 4) {
+            float sx = (s16)bus_read16(src) / 256.f, sy = (s16)bus_read16(src + 2) / 256.f;
+            float th = (bus_read16(src + 4) >> 8) / 128.f * 3.14159265f;
+            bus_write16(dst, (u16)(s16)(cosf(th) * sx * 256));
+            bus_write16(dst + stride, (u16)(s16)(-sinf(th) * sx * 256));
+            bus_write16(dst + stride * 2, (u16)(s16)(sinf(th) * sy * 256));
+            bus_write16(dst + stride * 3, (u16)(s16)(cosf(th) * sy * 256));
+        }
+        break;
+    }
+
+    case 0x10: { /* BitUnPack */
+        u32 src = r[0];
+        u32 dst = r[1];
+        u32 info = r[2];
+        u16 src_len = bus_read16(info);
+        u8 src_bpp = bus_read8(info + 2);
+        u8 dst_bpp = bus_read8(info + 3);
+        u32 data_offset = bus_read32(info + 4);
+        bool zero_flag = (data_offset >> 31) & 1;
+        data_offset &= 0x7FFFFFFF;
+
+        u32 src_off = 0;
+        u32 dst_off = 0;
+        u32 buffer = 0;
+        int bits_in_buffer = 0;
+        u8 src_mask = (u8)((1 << src_bpp) - 1);
+
+        while (src_off < src_len) {
+            u8 byte = bus_read8(src + src_off++);
+            for (int bit = 0; bit < 8; bit += src_bpp) {
+                u32 val = (byte >> bit) & src_mask;
+                if (val != 0 || !zero_flag) {
+                    val += (u32)data_offset;
+                }
+                buffer |= val << bits_in_buffer;
+                bits_in_buffer += dst_bpp;
+                if (bits_in_buffer >= 32) {
+                    bus_write32(dst + dst_off, buffer);
+                    dst_off += 4;
+                    buffer = 0;
+                    bits_in_buffer = 0;
+                }
+            }
+        }
+        if (bits_in_buffer > 0) {
+            bus_write32(dst + dst_off, buffer);
+        }
+        break;
+    }
+
+    case 0x11: { /* LZ77UnCompWram */
+        u32 src = r[0];
+        u32 dst = r[1];
+        u32 header = bus_read32(src);
+        advance_cycles(20);
+        u32 decomp_size = header >> 8;
+        u32 sp = src + 4;
+        u32 dp = 0;
+
+        while (dp < decomp_size) {
+            u8 flags = bus_read8(sp++);
+            advance_cycles(14);
+            for (int i = 7; i >= 0 && dp < decomp_size; i--) {
+                advance_cycles(32);
+                if (flags & (1 << i)) {
+                    /* Compressed */
+                    u8 b1 = bus_read8(sp++);
+                    u8 b2 = bus_read8(sp++);
+                    u32 length = ((b1 >> 4) & 0xF) + 3;
+                    u32 disp = ((u32)(b1 & 0xF) << 8) | b2;
+                    u32 ref = dp - disp - 1;
+                    for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                        advance_cycles(10);
+                        bus_write8(dst + dp, bus_read8(dst + ref + j));
+                        dp++;
+                    }
+                } else {
+                    /* Uncompressed */
+                    bus_write8(dst + dp++, bus_read8(sp++));
+                }
+            }
+        }
+        break;
+    }
+
+    case 0x12: { /* LZ77UnCompVram (16-bit writes) */
+        u32 src = r[0];
+        u32 dst = r[1];
+        u32 header = bus_read32(src);
+        advance_cycles(20);
+        u32 decomp_size = header >> 8;
+        u32 sp = src + 4;
+        u32 dp = 0;
+        u8 tmp_buf[2] = {0};
+        int tmp_idx = 0;
+
+        while (dp < decomp_size) {
+            u8 flags = bus_read8(sp++);
+            advance_cycles(14);
+            for (int i = 7; i >= 0 && dp < decomp_size; i--) {
+                u8 byte;
+                advance_cycles(32);
+                if (flags & (1 << i)) {
+                    u8 b1 = bus_read8(sp++);
+                    u8 b2 = bus_read8(sp++);
+                    u32 length = ((b1 >> 4) & 0xF) + 3;
+                    u32 disp = ((u32)(b1 & 0xF) << 8) | b2;
+                    u32 ref = dp - disp - 1;
+                    for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                        advance_cycles(14);
+                        byte = bus_read8(dst + ref + j);
+                        tmp_buf[tmp_idx++] = byte;
+                        if (tmp_idx == 2) {
+                            bus_write16(dst + dp - 1, (u16)tmp_buf[0] | ((u16)tmp_buf[1] << 8));
+                            tmp_idx = 0;
+                        }
+                        dp++;
+                    }
+                } else {
+                    byte = bus_read8(sp++);
+                    tmp_buf[tmp_idx++] = byte;
+                    if (tmp_idx == 2) {
+                        bus_write16(dst + dp - 1, (u16)tmp_buf[0] | ((u16)tmp_buf[1] << 8));
+                        tmp_idx = 0;
+                    }
+                    dp++;
+                }
+            }
+        }
+        break;
+    }
+
+    case 0x13: { /* HuffUnComp */
+        /* Huffman decompression - stub for now */
+        fprintf(stderr, "[swi] HuffUnComp not implemented\n");
+        break;
+    }
+
+    case 0x14: { /* RLUnCompWram */
+        u32 src = r[0];
+        u32 dst = r[1];
+        u32 header = bus_read32(src);
+        u32 decomp_size = header >> 8;
+        u32 sp = src + 4;
+        u32 dp = 0;
+
+        while (dp < decomp_size) {
+            u8 flag = bus_read8(sp++);
+            if (flag & 0x80) {
+                /* Run-length */
+                u32 length = (flag & 0x7F) + 3;
+                u8 val = bus_read8(sp++);
+                for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                    bus_write8(dst + dp++, val);
+                }
+            } else {
+                /* Uncompressed */
+                u32 length = (flag & 0x7F) + 1;
+                for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                    bus_write8(dst + dp++, bus_read8(sp++));
+                }
+            }
+        }
+        break;
+    }
+
+    case 0x15: { /* RLUnCompVram (16-bit writes) */
+        u32 src = r[0];
+        u32 dst = r[1];
+        u32 header = bus_read32(src);
+        u32 decomp_size = header >> 8;
+        u32 sp = src + 4;
+        u32 dp = 0;
+        u8 tmp_buf[2] = {0};
+        int tmp_idx = 0;
+
+        while (dp < decomp_size) {
+            u8 flag = bus_read8(sp++);
+            u32 length;
+            if (flag & 0x80) {
+                length = (flag & 0x7F) + 3;
+                u8 val = bus_read8(sp++);
+                for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                    tmp_buf[tmp_idx++] = val;
+                    if (tmp_idx == 2) {
+                        bus_write16(dst + dp - 1, (u16)tmp_buf[0] | ((u16)tmp_buf[1] << 8));
+                        tmp_idx = 0;
+                    }
+                    dp++;
+                }
+            } else {
+                length = (flag & 0x7F) + 1;
+                for (u32 j = 0; j < length && dp < decomp_size; j++) {
+                    u8 val = bus_read8(sp++);
+                    tmp_buf[tmp_idx++] = val;
+                    if (tmp_idx == 2) {
+                        bus_write16(dst + dp - 1, (u16)tmp_buf[0] | ((u16)tmp_buf[1] << 8));
+                        tmp_idx = 0;
+                    }
+                    dp++;
+                }
+            }
+        }
+        break;
+    }
+
+    default:
+        fprintf(stderr, "[swi] Unhandled SWI 0x%02X at PC=0x%08X\n", number, r[15]);
+        break;
+    }
+}
+
+/* ---- IWRAM Code Execution ---- */
+
+/* Mini Thumb interpreter for RAM code execution.
+ * Games copy small routines to IWRAM/EWRAM (crt0 init, decompression,
+ * DMA helpers). Rather than requiring all RAM code to be pre-compiled,
+ * we interpret it on the fly. This covers the common case of init code
+ * that the recompiled ROM functions call via BX to RAM addresses. */
+static void run_iwram_function_(u32 target);
+void run_iwram_function(u32 target) {
+    u32 saved_mode = bus_mode;   /* ponytail: calls back into ROM code keep this */
+    bus_mode = BUS_RAM_CODE;
+    run_iwram_function_(target);
+    bus_mode = saved_mode;
+}
+
+static void run_iwram_function_(u32 target) {
+    static int call_count = 0;
+    /* Quick sanity check: if target has Thumb bit set, check for valid Thumb prologue.
+     * If target is even (ARM mode), skip the check - ARM instruction bytes often look like ASCII.
+     * Only filter obvious non-code for Thumb targets. */
+    /* Check for data-as-code: skip if target looks like non-code data.
+     * Read memory directly (not via bus_read) to avoid cycle side effects. */
+    {
+        u32 peek = target & ~1u;
+        u32 region = peek >> 24;
+        u8* mem = NULL;
+        u32 off = 0;
+        if (region == 0x02) { mem = ewram; off = peek & 0x3FFFF; }
+        else if (region == 0x03) { mem = iwram; off = peek & 0x7FFF; }
+        else if (region >= 0x08 && region <= 0x0D) {
+            mem = rom_data;
+            off = (peek - 0x08000000u) % rom_size;
+        }
+        if (mem) {
+            u8 b0 = mem[off], b1 = mem[off+1];
+            u32 w = mem[off] | (mem[off+1]<<8) | (mem[off+2]<<16) | (mem[off+3]<<24);
+            /* Only erased/blank memory counts as "not code". Guessing from
+             * printable bytes skipped real code: m4a's mixer starts with
+             * 0x7943 (LDRB r3,[r0,#5]), bytes "Cy", so it never ran and the
+             * sound driver's lock was never released. */
+            (void)b0; (void)b1;
+            bool is_data = (w == 0 || w == 0xFFFFFFFF || (w & 0xFFFF0000) == 0xFFFF0000);
+            if (!is_data && !(target & 1) && ((w >> 28) & 0xF) == 0xF)
+                is_data = true; /* ARM NV condition: not code on ARMv4 */
+            if (is_data) {
+                r[15] = r[14] & ~1u;
+                return;
+            }
+        }
+    }
+
+    call_count++;
+    {
+        /* GBA_TRACE_INTERP=N: log the first N interpreter entries */
+        static long trace_left = -1;
+        if (trace_left < 0) {
+            const char* e = getenv("GBA_TRACE_INTERP");
+            trace_left = e ? atol(e) : 0;
+        }
+        if (trace_left > 0) {
+            trace_left--;
+            fprintf(stderr, "[interp] enter 0x%08X lr=0x%08X sp=0x%08X frame=%u\n",
+                    target, r[14], r[13], frame_count);
+        }
+    }
+
+    bool thumb = (target & 1) != 0;
+    u32 pc = target & ~1u;
+    u32 saved_lr = r[14];
+
+    /* Set LR to a sentinel so we know when to stop */
+    u32 return_sentinel = 0xDEAD0000;
+#define RAM_LR() (((r[14] >> 24) == 0x02 || (r[14] >> 24) == 0x03))
+    /* Leaving RAM code for ROM without a RAM return address: to a function
+     * entry it's a tail call (run it; its return is ours), anywhere else
+     * it's a return past our caller, which the native unwind delivers. */
+#define LEAVE_TO_ROM(t) do { \
+        if (recomp_lookup((t) & ~1u)) { g_ret = 0; cpu_bx(t); goto done; } \
+        g_ret = (t) | 1u; goto done; \
+    } while (0)
+    r[14] = return_sentinel | 1; /* Thumb return address */
+
+    int steps = 0;
+    int max_steps = 2000000;
+
+    u32 next_pc = pc;   /* a jump elsewhere refills the pipeline: N + S */
+    while (steps < max_steps) {
+        steps++;
+        if (pc != next_pc) charge(2 * access_cycles(pc, !thumb));
+
+        if (!thumb) {
+            /* ARM mode interpreter */
+            charge(access_cycles(pc, 1)); u32 insn = read32_(pc);
+            next_pc = pc + 4;
+            pc += 4;
+
+            /* Check condition */
+            int cond = (insn >> 28) & 0xF;
+            bool exec = false;
+            switch (cond) {
+            case 0x0: exec = CPU_Z; break;
+            case 0x1: exec = !CPU_Z; break;
+            case 0x2: exec = CPU_C; break;
+            case 0x3: exec = !CPU_C; break;
+            case 0x4: exec = CPU_N; break;
+            case 0x5: exec = !CPU_N; break;
+            case 0x6: exec = CPU_V; break;
+            case 0x7: exec = !CPU_V; break;
+            case 0x8: exec = CPU_C && !CPU_Z; break;
+            case 0x9: exec = !CPU_C || CPU_Z; break;
+            case 0xA: exec = CPU_N == CPU_V; break;
+            case 0xB: exec = CPU_N != CPU_V; break;
+            case 0xC: exec = !CPU_Z && (CPU_N == CPU_V); break;
+            case 0xD: exec = CPU_Z || (CPU_N != CPU_V); break;
+            case 0xE: exec = true; break;
+            case 0xF: exec = false; break; /* NV / special */
+            }
+            if (!exec) continue;
+
+            /* BX Rm */
+            if ((insn & 0x0FFFFFF0) == 0x012FFF10) {
+                u32 rm = insn & 0xF;
+                u32 addr = r[rm];
+                if ((addr & ~1u) == (return_sentinel & ~1u)) break;
+                if ((addr >> 24) == 0x08) {
+                    /* ROM target. With LR pointing back into RAM it's a call
+                     * (MOV lr, pc; BX rN): run it natively and carry on.
+                     * Otherwise it's a return or tail jump out of RAM code
+                     * (m4a's mixer pops SoundMain's frame and returns to its
+                     * caller): leave, and let the native unwind take it. */
+                    if (RAM_LR()) { cpu_bx(addr); g_ret = 0; continue; }
+                    LEAVE_TO_ROM(addr);
+                }
+                /* Sanity check: BX to a region that holds no executable code is
+                 * almost always an uninitialized function pointer (e.g. game
+                 * dispatched IRQ before populating its subhandler table).
+                 * Bail out loudly instead of fetching zeros forever. */
+                u8 region = addr >> 24;
+                if (region != 0x02 /* EWRAM */ && region != 0x03 /* IWRAM */ &&
+                    region != 0x00 /* BIOS */) {
+                    static int _bx_warns = 0;
+                    if (_bx_warns++ < 5)
+                        fprintf(stderr, "[interp] ARM BX to unmapped 0x%08X (rm=r%u, pc=0x%08X) - bailing\n",
+                                addr, rm, pc - 4);
+                    break;
+                }
+                thumb = (addr & 1) != 0;
+                pc = addr & ~1u;
+                continue;
+            }
+
+            /* B / BL */
+            if ((insn & 0x0E000000) == 0x0A000000) {
+                s32 offset = (s32)(insn << 8) >> 6;
+                bool link = (insn >> 24) & 1;
+                if (link) r[14] = pc; /* PC already advanced */
+                u32 target = (u32)((s32)pc + offset + 4);
+                pc = target;
+                continue;
+            }
+
+            /* MSR (must come BEFORE data-processing: MSR's encoding overlaps
+             * with TST/TEQ/CMP/CMN-without-S, and the data-processing path
+             * would otherwise misinterpret it and write the result into pc
+             * when Rd=15 (e.g. MSR CPSR_cf, r3 = 0xE129F003 looks like TEQ
+             * with Rd=pc, leading to garbage pc loads). */
+            if ((insn & 0x0FB0F000) == 0x0120F000) {
+                u32 val;
+                if (insn & (1 << 25)) {
+                    u32 imm = insn & 0xFF;
+                    u32 rot = ((insn >> 8) & 0xF) * 2;
+                    val = rot ? (imm >> rot) | (imm << (32 - rot)) : imm;
+                } else {
+                    val = r[insn & 0xF];
+                }
+                u32 mask = 0;
+                if (insn & (1 << 19)) mask |= 0xF0000000;
+                if (insn & (1 << 16)) mask |= 0x000000FF;
+                bool spsr = (insn >> 22) & 1;
+                if (spsr) cpu_set_spsr(val, mask >> 28);
+                else cpu_set_cpsr(val, mask >> 28);
+                continue;
+            }
+
+            /* MRS (also must precede data-processing for the same reason) */
+            if ((insn & 0x0FBF0FFF) == 0x010F0000) {
+                int rd_idx = (insn >> 12) & 0xF;
+                bool spsr = (insn >> 22) & 1;
+                r[rd_idx] = spsr ? cpu_get_spsr() : cpu_get_cpsr();
+                continue;
+            }
+
+            /* Data processing: AND, EOR, SUB, RSB, ADD, ADC, SBC, RSC, TST, TEQ, CMP, CMN, ORR, MOV, BIC, MVN.
+             * Exclude halfword/signed transfers (bit 25=0, bit 7=1, bit 4=1 with bits 6-5 non-zero) and
+             * multiply/long-multiply (bit 25=0, bits 7-4 = 1001), which all share the bits 27-26 = 00
+             * encoding space with data-processing register form. */
+            if ((insn & 0x0C000000) == 0x00000000 &&
+                /* not halfword/signed transfer (bit 7=1 && bit 4=1 && bits 6-5 != 00) */
+                !((insn & (1u << 25)) == 0 && (insn & 0x90) == 0x90 && (insn & 0x60) != 0) &&
+                /* not multiply (bits 7-4 = 1001 with bit 25=0) */
+                !((insn & (1u << 25)) == 0 && (insn & 0xF0) == 0x90)) {
+                int opcode = (insn >> 21) & 0xF;
+                bool s_bit = (insn >> 20) & 1;
+                int rn = (insn >> 16) & 0xF;
+                int rd = (insn >> 12) & 0xF;
+
+                /* Compute operand2 (shifter operand) */
+                u32 op2;
+                bool shift_carry = CPU_C;
+                if (insn & (1 << 25)) {
+                    /* Immediate: 8-bit rotated */
+                    u32 imm = insn & 0xFF;
+                    u32 rot = ((insn >> 8) & 0xF) * 2;
+                    if (rot > 0) {
+                        op2 = (imm >> rot) | (imm << (32 - rot));
+                        shift_carry = (op2 >> 31) & 1;
+                    } else {
+                        op2 = imm;
+                    }
+                } else {
+                    /* Register with shift */
+                    int rm = insn & 0xF;
+                    op2 = r[rm];
+                    if (rm == 15) op2 = pc + 4;
+                    int shift_type = (insn >> 5) & 3;
+                    u32 shift_amount;
+                    if (insn & (1 << 4)) {
+                        shift_amount = r[(insn >> 8) & 0xF] & 0xFF;
+                    } else {
+                        shift_amount = (insn >> 7) & 0x1F;
+                    }
+                    switch (shift_type) {
+                    case 0: /* LSL */
+                        if (shift_amount > 0) {
+                            if (shift_amount < 32) { shift_carry = (op2 >> (32 - shift_amount)) & 1; op2 <<= shift_amount; }
+                            else if (shift_amount == 32) { shift_carry = op2 & 1; op2 = 0; }
+                            else { shift_carry = 0; op2 = 0; }
+                        }
+                        break;
+                    case 1: /* LSR */
+                        if (shift_amount == 0) shift_amount = 32;
+                        if (shift_amount < 32) { shift_carry = (op2 >> (shift_amount - 1)) & 1; op2 >>= shift_amount; }
+                        else if (shift_amount == 32) { shift_carry = (op2 >> 31) & 1; op2 = 0; }
+                        else { shift_carry = 0; op2 = 0; }
+                        break;
+                    case 2: /* ASR */
+                        if (shift_amount == 0) shift_amount = 32;
+                        if (shift_amount >= 32) { shift_carry = (op2 >> 31) & 1; op2 = (u32)((s32)op2 >> 31); }
+                        else { shift_carry = (op2 >> (shift_amount - 1)) & 1; op2 = (u32)((s32)op2 >> shift_amount); }
+                        break;
+                    case 3: /* ROR/RRX */
+                        if (shift_amount == 0) { /* RRX */
+                            shift_carry = op2 & 1;
+                            op2 = (CPU_C ? 0x80000000u : 0) | (op2 >> 1);
+                        } else {
+                            shift_amount &= 31;
+                            if (shift_amount == 0) { shift_carry = (op2 >> 31) & 1; }
+                            else { op2 = (op2 >> shift_amount) | (op2 << (32 - shift_amount)); shift_carry = (op2 >> 31) & 1; }
+                        }
+                        break;
+                    }
+                }
+
+                u32 a = r[rn];
+                if (rn == 15) a = pc + 4;
+                u32 result;
+                switch (opcode) {
+                case 0x0: result = a & op2; if (rd < 15) r[rd] = result; break; /* AND */
+                case 0x1: result = a ^ op2; if (rd < 15) r[rd] = result; break; /* EOR */
+                case 0x2: /* SUB */ cpu_sub(rd < 15 ? &r[rd] : NULL, a, op2, s_bit); continue;
+                case 0x3: /* RSB */ cpu_sub(rd < 15 ? &r[rd] : NULL, op2, a, s_bit); continue;
+                case 0x4: /* ADD */ cpu_add(rd < 15 ? &r[rd] : NULL, a, op2, s_bit); continue;
+                case 0x5: /* ADC */ cpu_adc(rd < 15 ? &r[rd] : NULL, a, op2, s_bit); continue;
+                case 0x6: /* SBC */ cpu_sbc(rd < 15 ? &r[rd] : NULL, a, op2, s_bit); continue;
+                case 0x7: /* RSC */ { u32 tmp = CPU_C; cpu_sbc(rd < 15 ? &r[rd] : NULL, op2, a, s_bit); if (!s_bit) CPU_C = tmp; continue; }
+                case 0x8: result = a & op2; break; /* TST */
+                case 0x9: result = a ^ op2; break; /* TEQ */
+                case 0xA: /* CMP */ cpu_sub(NULL, a, op2, true); continue;
+                case 0xB: /* CMN */ cpu_add(NULL, a, op2, true); continue;
+                case 0xC: result = a | op2; if (rd < 15) r[rd] = result; break; /* ORR */
+                case 0xD: result = op2; if (rd < 15) r[rd] = result; break; /* MOV */
+                case 0xE: result = a & ~op2; if (rd < 15) r[rd] = result; break; /* BIC */
+                case 0xF: result = ~op2; if (rd < 15) r[rd] = result; break; /* MVN */
+                default: result = 0; break;
+                }
+                if (s_bit && opcode != 0x2 && opcode != 0x3 && opcode != 0x4 &&
+                    opcode != 0x5 && opcode != 0x6 && opcode != 0x7 &&
+                    opcode != 0xA && opcode != 0xB) {
+                    CPU_N = (result >> 31) & 1;
+                    CPU_Z = (result == 0);
+                    CPU_C = shift_carry;
+                    /* V unchanged for logical ops */
+                }
+                if (rd == 15) {
+                    pc = result & ~3u;
+                    u8 reg4 = pc >> 24;
+                    if (reg4 != 0x00 && reg4 != 0x02 && reg4 != 0x03 && reg4 != 0x08) {
+                        static int _dpc = 0;
+                        if (_dpc++ < 5)
+                            fprintf(stderr, "[interp] DataProc pc <- 0x%08X opcode=%X insn=0x%08X at 0x%08X\n",
+                                    pc, opcode, insn, pc - 4);
+                    }
+                    /* Check for mode switch if S bit set */
+                }
+                continue;
+            }
+
+            /* Single data transfer: LDR/STR */
+            if ((insn & 0x0C000000) == 0x04000000) {
+                bool i = (insn >> 25) & 1;  /* 0=immediate, 1=register */
+                bool p = (insn >> 24) & 1;  /* pre/post indexing */
+                bool u = (insn >> 23) & 1;  /* up/down */
+                bool b = (insn >> 22) & 1;  /* byte/word */
+                bool w = (insn >> 21) & 1;  /* writeback */
+                bool l = (insn >> 20) & 1;  /* load/store */
+                int rn_idx = (insn >> 16) & 0xF;
+                int rd_idx = (insn >> 12) & 0xF;
+
+                u32 base = r[rn_idx];
+                if (rn_idx == 15) base = pc + 4;
+                u32 offset2;
+                if (!i) {
+                    offset2 = insn & 0xFFF;
+                } else {
+                    int rm = insn & 0xF;
+                    offset2 = r[rm];
+                    int shift_type = (insn >> 5) & 3;
+                    u32 shift_amt = (insn >> 7) & 0x1F;
+                    switch (shift_type) {
+                    case 0: offset2 = shift_amt ? offset2 << shift_amt : offset2; break;
+                    case 1: offset2 = shift_amt ? offset2 >> shift_amt : 0; break;
+                    case 2: offset2 = shift_amt ? (u32)((s32)offset2 >> shift_amt) : (u32)((s32)offset2 >> 31); break;
+                    case 3: offset2 = shift_amt ? (offset2 >> shift_amt) | (offset2 << (32 - shift_amt)) : (CPU_C ? 0x80000000u : 0) | (offset2 >> 1); break;
+                    }
+                }
+
+                u32 addr = p ? (u ? base + offset2 : base - offset2) : base;
+                if (l) {
+                    r[rd_idx] = b ? bus_read8(addr) : bus_read32(addr);
+                    if (rd_idx == 15) {
+                        pc = r[15] & ~3u;
+                        u8 reg2 = pc >> 24;
+                        if (reg2 != 0x00 && reg2 != 0x02 && reg2 != 0x03 && reg2 != 0x08) {
+                            static int _lpc = 0;
+                            if (_lpc++ < 5)
+                                fprintf(stderr, "[interp] LDR pc <- 0x%08X from [0x%08X] insn=0x%08X at 0x%08X\n",
+                                        pc, addr, insn, pc - 4);
+                        }
+                    }
+                } else {
+                    u32 val = r[rd_idx];
+                    if (rd_idx == 15) val = pc + 4;
+                    if (b) bus_write8(addr, (u8)val);
+                    else bus_write32(addr, val);
+                }
+                if (!p) addr = u ? base + offset2 : base - offset2;
+                if (w || !p) r[rn_idx] = addr;
+                continue;
+            }
+
+            /* Block data transfer: LDM/STM */
+            if ((insn & 0x0E000000) == 0x08000000) {
+                bool p = (insn >> 24) & 1;
+                bool u = (insn >> 23) & 1;
+                bool s_bit2 = (insn >> 22) & 1; (void)s_bit2;
+                bool w = (insn >> 21) & 1;
+                bool l = (insn >> 20) & 1;
+                int rn_idx = (insn >> 16) & 0xF;
+                u16 rlist = insn & 0xFFFF;
+
+                u32 base = r[rn_idx];
+                int count = 0;
+                for (int i2 = 0; i2 < 16; i2++) if (rlist & (1 << i2)) count++;
+
+                u32 start;
+                if (u) start = p ? base + 4 : base;
+                else start = p ? base - count * 4 : base - count * 4 + 4;
+
+                u32 addr2 = start;
+                for (int i2 = 0; i2 < 16; i2++) {
+                    if (!(rlist & (1 << i2))) continue;
+                    if (l) {
+                        r[i2] = bus_read32(addr2);
+                        if (i2 == 15) {
+                            pc = r[15] & ~3u;
+                            u8 reg3 = pc >> 24;
+                            if (reg3 != 0x00 && reg3 != 0x02 && reg3 != 0x03 && reg3 != 0x08) {
+                                static int _lmpc = 0;
+                                if (_lmpc++ < 5)
+                                    fprintf(stderr, "[interp] LDM pc <- 0x%08X from [0x%08X] rlist=0x%04X (S=%d) base=0x%08X\n",
+                                            pc, addr2, rlist, s_bit2, r[rn_idx]);
+                            }
+                        }
+                    } else {
+                        bus_write32(addr2, r[i2]);
+                    }
+                    addr2 += 4;
+                }
+                if (w) r[rn_idx] = u ? base + count * 4 : base - count * 4;
+                if (l && (rlist & 0x8000)) {
+                    if ((r[15] & ~1u) == (return_sentinel & ~1u)) goto done;
+                    if ((r[15] >> 24) == 0x08) { g_ret = r[15] | 1u; goto done; }
+                }
+                continue;
+            }
+
+            /* MSR */
+            if ((insn & 0x0FB0F000) == 0x0120F000) {
+                u32 val;
+                if (insn & (1 << 25)) {
+                    u32 imm = insn & 0xFF;
+                    u32 rot = ((insn >> 8) & 0xF) * 2;
+                    val = rot ? (imm >> rot) | (imm << (32 - rot)) : imm;
+                } else {
+                    val = r[insn & 0xF];
+                }
+                u32 mask = 0;
+                if (insn & (1 << 19)) mask |= 0xF0000000;
+                if (insn & (1 << 16)) mask |= 0x000000FF;
+                bool spsr = (insn >> 22) & 1;
+                if (spsr) cpu_set_spsr(val, mask >> 28);
+                else cpu_set_cpsr(val, mask >> 28);
+                continue;
+            }
+
+            /* MRS */
+            if ((insn & 0x0FBF0FFF) == 0x010F0000) {
+                int rd_idx = (insn >> 12) & 0xF;
+                bool spsr = (insn >> 22) & 1;
+                r[rd_idx] = spsr ? cpu_get_spsr() : cpu_get_cpsr();
+                continue;
+            }
+
+            /* MUL/MLA */
+            if ((insn & 0x0FC000F0) == 0x00000090) {
+                int rd_idx = (insn >> 16) & 0xF;
+                int rn_idx2 = (insn >> 12) & 0xF;
+                int rs_idx = (insn >> 8) & 0xF;
+                int rm_idx = insn & 0xF;
+                bool accumulate = (insn >> 21) & 1;
+                bool s_mul = (insn >> 20) & 1;
+                u32 result = r[rm_idx] * r[rs_idx];
+                if (accumulate) result += r[rn_idx2];
+                r[rd_idx] = result;
+                if (s_mul) cpu_update_nz(result);
+                continue;
+            }
+
+            /* UMULL/UMLAL/SMULL/SMLAL: m4a's mixer reaches its 32x32->64
+             * helper (ARM, in ROM) through the interpreter */
+            if ((insn & 0x0F8000F0) == 0x00800090) {
+                int hi_idx = (insn >> 16) & 0xF, lo_idx = (insn >> 12) & 0xF;
+                int rs_idx = (insn >> 8) & 0xF, rm_idx = insn & 0xF;
+                bool sgn = (insn >> 22) & 1, acc = (insn >> 21) & 1, s_mul = (insn >> 20) & 1;
+                u64 res = sgn ? (u64)((s64)(s32)r[rm_idx] * (s64)(s32)r[rs_idx])
+                              : (u64)r[rm_idx] * (u64)r[rs_idx];
+                if (acc) res += ((u64)r[hi_idx] << 32) | r[lo_idx];
+                r[lo_idx] = (u32)res;
+                r[hi_idx] = (u32)(res >> 32);
+                if (s_mul) { CPU_N = (res >> 63) != 0; CPU_Z = res == 0; }
+                continue;
+            }
+
+            /* SWI */
+            if ((insn & 0x0F000000) == 0x0F000000) {
+                gba_swi((insn >> 16) & 0xFF);
+                continue;
+            }
+
+            /* Halfword transfer: LDRH/STRH/LDRSB/LDRSH */
+            if ((insn & 0x0E000090) == 0x00000090 && (insn & 0x00000060)) {
+                bool p = (insn >> 24) & 1;
+                bool u = (insn >> 23) & 1;
+                bool imm_off = (insn >> 22) & 1;
+                bool w = (insn >> 21) & 1;
+                bool l = (insn >> 20) & 1;
+                int rn_idx = (insn >> 16) & 0xF;
+                int rd_idx = (insn >> 12) & 0xF;
+                int sh = (insn >> 5) & 3;
+
+                u32 base = r[rn_idx];
+                u32 off;
+                if (imm_off) off = ((insn >> 4) & 0xF0) | (insn & 0xF);
+                else off = r[insn & 0xF];
+
+                u32 addr = p ? (u ? base + off : base - off) : base;
+                if (l) {
+                    switch (sh) {
+                    case 1: r[rd_idx] = bus_read16(addr); break; /* LDRH */
+                    case 2: r[rd_idx] = (u32)(s32)(s8)bus_read8(addr); break; /* LDRSB */
+                    case 3: r[rd_idx] = (u32)(s32)(s16)bus_read16(addr); break; /* LDRSH */
+                    }
+                } else {
+                    if (sh == 1) bus_write16(addr, (u16)r[rd_idx]); /* STRH */
+                }
+                if (!p) addr = u ? base + off : base - off;
+                if (w || !p) r[rn_idx] = addr;
+                continue;
+            }
+
+            /* Unhandled ARM instruction */
+            fprintf(stderr, "[interp] Unknown ARM insn 0x%08X at 0x%08X\n", insn, pc - 4);
+            break;
+        }
+
+        /* Thumb mode interpreter */
+        charge(access_cycles(pc, 0)); u16 insn = read16_(pc);
+        next_pc = pc + 2;
+        pc += 2;
+
+        /* Format 2: Add/Sub - MUST check before Format 1 (overlapping encoding) */
+        if ((insn & 0xF800) == 0x1800) {
+            int i = (insn >> 10) & 1;
+            int op = (insn >> 9) & 1;
+            u32 rn_or_imm = (insn >> 6) & 7;
+            int rs = (insn >> 3) & 7;
+            int rd = insn & 7;
+            u32 operand = i ? rn_or_imm : r[rn_or_imm];
+            if (op) cpu_sub(&r[rd], r[rs], operand, true);
+            else cpu_add(&r[rd], r[rs], operand, true);
+            continue;
+        }
+
+        /* Format 1: Move shifted register - LSL/LSR/ASR (NOT add/sub which is Format 2) */
+        if ((insn & 0xE000) == 0x0000) {
+            int op = (insn >> 11) & 3;
+            u32 offset = (insn >> 6) & 0x1F;
+            int rs = (insn >> 3) & 7;
+            int rd = insn & 7;
+            u32 val = r[rs];
+            switch (op) {
+            case 0: /* LSL */
+                if (offset > 0) { CPU_C = (val >> (32 - offset)) & 1; val <<= offset; }
+                break;
+            case 1: /* LSR */
+                if (offset == 0) offset = 32;
+                CPU_C = (val >> (offset - 1)) & 1;
+                val = offset >= 32 ? 0 : val >> offset;
+                break;
+            case 2: /* ASR */
+                if (offset == 0) offset = 32;
+                CPU_C = ((s32)val >> (offset > 31 ? 31 : offset - 1)) & 1;
+                val = (u32)((s32)val >> (offset > 31 ? 31 : offset));
+                break;
+            }
+            r[rd] = val;
+            cpu_update_nz(val);
+            continue;
+        }
+
+        /* Format 3: Mov/Cmp/Add/Sub immediate */
+        if ((insn & 0xE000) == 0x2000) {
+            int op = (insn >> 11) & 3;
+            int rd = (insn >> 8) & 7;
+            u32 imm = insn & 0xFF;
+            switch (op) {
+            case 0: r[rd] = imm; cpu_update_nz(imm); break;
+            case 1: cpu_sub(NULL, r[rd], imm, true); break;
+            case 2: cpu_add(&r[rd], r[rd], imm, true); break;
+            case 3: cpu_sub(&r[rd], r[rd], imm, true); break;
+            }
+            continue;
+        }
+
+        /* Format 4: ALU operations */
+        if ((insn & 0xFC00) == 0x4000) {
+            int op = (insn >> 6) & 0xF;
+            int rs = (insn >> 3) & 7;
+            int rd = insn & 7;
+            u32 a = r[rd], b = r[rs], result;
+            switch (op) {
+            case 0x0: result = a & b; r[rd] = result; cpu_update_nz(result); break;
+            case 0x1: result = a ^ b; r[rd] = result; cpu_update_nz(result); break;
+            case 0x2: /* LSL */ {
+                u32 shift = b & 0xFF;
+                result = shift >= 32 ? 0 : a << shift;
+                if (shift > 0 && shift <= 32) CPU_C = (a >> (32 - shift)) & 1;
+                r[rd] = result; cpu_update_nz(result); break;
+            }
+            case 0x3: /* LSR */ {
+                u32 shift = b & 0xFF;
+                result = shift >= 32 ? 0 : a >> shift;
+                if (shift > 0 && shift <= 32) CPU_C = (a >> (shift - 1)) & 1;
+                r[rd] = result; cpu_update_nz(result); break;
+            }
+            case 0x4: /* ASR */ {
+                u32 shift = b & 0xFF;
+                result = shift >= 32 ? (u32)((s32)a >> 31) : (u32)((s32)a >> shift);
+                r[rd] = result; cpu_update_nz(result); break;
+            }
+            case 0x5: cpu_adc(&r[rd], a, b, true); break;
+            case 0x6: cpu_sbc(&r[rd], a, b, true); break;
+            case 0x7: /* ROR */ {
+                u32 shift = b & 0xFF;
+                if (shift == 0) { result = a; }
+                else { shift &= 31; result = shift ? (a >> shift) | (a << (32 - shift)) : a; CPU_C = (a >> 31) & 1; }
+                r[rd] = result; cpu_update_nz(result); break;
+            }
+            case 0x8: result = a & b; cpu_update_nz(result); break; /* TST */
+            case 0x9: cpu_sub(&r[rd], 0, b, true); break; /* NEG */
+            case 0xA: cpu_sub(NULL, a, b, true); break; /* CMP */
+            case 0xB: cpu_add(NULL, a, b, true); break; /* CMN */
+            case 0xC: result = a | b; r[rd] = result; cpu_update_nz(result); break;
+            case 0xD: result = (u32)((s32)a * (s32)b); r[rd] = result; cpu_update_nz(result); break;
+            case 0xE: result = a & ~b; r[rd] = result; cpu_update_nz(result); break;
+            case 0xF: result = ~b; r[rd] = result; cpu_update_nz(result); break;
+            }
+            continue;
+        }
+
+        /* Format 5: Hi register ops / BX */
+        if ((insn & 0xFC00) == 0x4400) {
+            int op = (insn >> 8) & 3;
+            int h1 = (insn >> 7) & 1;
+            int h2 = (insn >> 6) & 1;
+            int rs = ((insn >> 3) & 7) | (h2 << 3);
+            int rd = (insn & 7) | (h1 << 3);
+            u32 val = r[rs];
+            if (rs == 15) val = pc + 2;
+            switch (op) {
+            case 0: r[rd] = r[rd] + val; if (rd == 15) { pc = r[15] & ~1u; } break;
+            case 1: cpu_sub(NULL, r[rd], val, true); break;
+            case 2: r[rd] = val; if (rd == 15) { pc = r[15] & ~1u; } break;
+            case 3: /* BX */
+                if ((val & ~1u) == (return_sentinel & ~1u)) goto done;
+                /* ROM target: a call if LR points back into RAM, otherwise
+                 * a return/tail jump out (see the ARM BX case) */
+                if ((val >> 24) == 0x08) {
+                    if (RAM_LR()) { cpu_bx(val); g_ret = 0; break; }
+                    LEAVE_TO_ROM(val);
+                }
+                thumb = (val & 1) != 0;
+                pc = val & ~1u;
+                break;
+            }
+            continue;
+        }
+
+        /* Format 6: PC-relative load */
+        if ((insn & 0xF800) == 0x4800) {
+            int rd = (insn >> 8) & 7;
+            u32 offset = (insn & 0xFF) << 2;
+            u32 addr = ((pc + 2) & ~3u) + offset;
+            r[rd] = bus_read32(addr);
+            continue;
+        }
+
+        /* Format 7/8: Load/store register offset */
+        if ((insn & 0xF200) == 0x5000) {
+            int ro = (insn >> 6) & 7;
+            int rb = (insn >> 3) & 7;
+            int rd = insn & 7;
+            u32 addr = r[rb] + r[ro];
+            int op = (insn >> 10) & 3;
+            switch (op) {
+            case 0: bus_write32(addr, r[rd]); break;        /* STR */
+            case 1: bus_write8(addr, (u8)r[rd]); break;     /* STRB */
+            case 2: r[rd] = bus_read32(addr); break;        /* LDR */
+            case 3: r[rd] = bus_read8(addr); break;         /* LDRB */
+            }
+            continue;
+        }
+        if ((insn & 0xF200) == 0x5200) {
+            int ro = (insn >> 6) & 7;
+            int rb = (insn >> 3) & 7;
+            int rd = insn & 7;
+            u32 addr = r[rb] + r[ro];
+            int op = (insn >> 10) & 3;
+            switch (op) {
+            case 0: bus_write16(addr, (u16)r[rd]); break;   /* STRH */
+            case 1: r[rd] = (u32)(s32)(s8)bus_read8(addr); break; /* LDSB */
+            case 2: r[rd] = bus_read16(addr); break;        /* LDRH */
+            case 3: r[rd] = (u32)(s32)(s16)bus_read16(addr); break; /* LDSH */
+            }
+            continue;
+        }
+
+        /* Format 9: Load/store immediate offset */
+        if ((insn & 0xE000) == 0x6000) {
+            int b = (insn >> 12) & 1;
+            int l = (insn >> 11) & 1;
+            u32 offset = (insn >> 6) & 0x1F;
+            int rb = (insn >> 3) & 7;
+            int rd = insn & 7;
+            if (b) { /* Byte */
+                u32 addr = r[rb] + offset;
+                if (l) r[rd] = bus_read8(addr);
+                else bus_write8(addr, (u8)r[rd]);
+            } else { /* Word */
+                u32 addr = r[rb] + (offset << 2);
+                if (l) r[rd] = bus_read32(addr);
+                else bus_write32(addr, r[rd]);
+            }
+            continue;
+        }
+
+        /* Format 10: Load/store halfword */
+        if ((insn & 0xF000) == 0x8000) {
+            int l = (insn >> 11) & 1;
+            u32 offset = ((insn >> 6) & 0x1F) << 1;
+            int rb = (insn >> 3) & 7;
+            int rd = insn & 7;
+            u32 addr = r[rb] + offset;
+            if (l) r[rd] = bus_read16(addr);
+            else bus_write16(addr, (u16)r[rd]);
+            continue;
+        }
+
+        /* Format 11: SP-relative load/store */
+        if ((insn & 0xF000) == 0x9000) {
+            int l = (insn >> 11) & 1;
+            int rd = (insn >> 8) & 7;
+            u32 offset = (insn & 0xFF) << 2;
+            u32 addr = r[13] + offset;
+            if (l) r[rd] = bus_read32(addr);
+            else bus_write32(addr, r[rd]);
+            continue;
+        }
+
+        /* Format 12: Load address (ADD Rd, PC/SP, #imm) */
+        if ((insn & 0xF000) == 0xA000) {
+            int sp = (insn >> 11) & 1;
+            int rd = (insn >> 8) & 7;
+            u32 offset = (insn & 0xFF) << 2;
+            r[rd] = sp ? (r[13] + offset) : (((pc + 2) & ~3u) + offset);
+            continue;
+        }
+
+        /* Format 13: Add offset to SP */
+        if ((insn & 0xFF00) == 0xB000) {
+            u32 offset = (insn & 0x7F) << 2;
+            if (insn & 0x80) r[13] -= offset;
+            else r[13] += offset;
+            continue;
+        }
+
+        /* Format 14: Push/Pop */
+        if ((insn & 0xF600) == 0xB400) {
+            int l = (insn >> 11) & 1;
+            int pclr = (insn >> 8) & 1;
+            u8 rlist = insn & 0xFF;
+            if (l) { /* POP */
+                for (int i = 0; i < 8; i++) {
+                    if (rlist & (1 << i)) { r[i] = bus_read32(r[13]); r[13] += 4; }
+                }
+                if (pclr) {
+                    u32 val = bus_read32(r[13]); r[13] += 4;
+                    if ((val & ~1u) == (return_sentinel & ~1u)) goto done;
+                    if ((val >> 24) == 0x08) { r[15] = val; g_ret = val | 1u; goto done; }
+                    thumb = (val & 1) != 0;
+                    pc = val & ~1u;
+                }
+            } else { /* PUSH */
+                if (pclr) { r[13] -= 4; bus_write32(r[13], r[14]); }
+                for (int i = 7; i >= 0; i--) {
+                    if (rlist & (1 << i)) { r[13] -= 4; bus_write32(r[13], r[i]); }
+                }
+            }
+            continue;
+        }
+
+        /* Format 15: Multiple load/store (LDMIA/STMIA) */
+        if ((insn & 0xF000) == 0xC000) {
+            int l = (insn >> 11) & 1;
+            int rb = (insn >> 8) & 7;
+            u8 rlist = insn & 0xFF;
+            u32 addr = r[rb];
+            for (int i = 0; i < 8; i++) {
+                if (rlist & (1 << i)) {
+                    if (l) r[i] = bus_read32(addr);
+                    else bus_write32(addr, r[i]);
+                    addr += 4;
+                }
+            }
+            r[rb] = addr;
+            continue;
+        }
+
+        /* Format 16: Conditional branch */
+        if ((insn & 0xF000) == 0xD000) {
+            int cond = (insn >> 8) & 0xF;
+            s32 offset = (s32)(s8)(insn & 0xFF) << 1;
+            bool take = false;
+            switch (cond) {
+            case 0x0: take = CPU_Z; break;
+            case 0x1: take = !CPU_Z; break;
+            case 0x2: take = CPU_C; break;
+            case 0x3: take = !CPU_C; break;
+            case 0x4: take = CPU_N; break;
+            case 0x5: take = !CPU_N; break;
+            case 0x6: take = CPU_V; break;
+            case 0x7: take = !CPU_V; break;
+            case 0x8: take = CPU_C && !CPU_Z; break;
+            case 0x9: take = !CPU_C || CPU_Z; break;
+            case 0xA: take = CPU_N == CPU_V; break;
+            case 0xB: take = CPU_N != CPU_V; break;
+            case 0xC: take = !CPU_Z && (CPU_N == CPU_V); break;
+            case 0xD: take = CPU_Z || (CPU_N != CPU_V); break;
+            case 0xF: /* SWI */
+                gba_swi(insn & 0xFF);
+                take = false;
+                break;
+            }
+            if (take) pc = (u32)((s32)pc + offset + 2);
+            continue;
+        }
+
+        /* Format 17: SWI */
+        if ((insn & 0xFF00) == 0xDF00) {
+            gba_swi(insn & 0xFF);
+            continue;
+        }
+
+        /* Format 18: Unconditional branch */
+        if ((insn & 0xF800) == 0xE000) {
+            s32 offset = (s32)(insn << 21) >> 20;
+            pc = (u32)((s32)pc + offset + 2);
+            continue;
+        }
+
+        /* Format 19: Long branch with link (BL) */
+        if ((insn & 0xF800) == 0xF000) {
+            charge(access_cycles(pc, 0)); u16 insn2 = read16_(pc);
+            pc += 2;
+            if ((insn2 & 0xF800) == 0xF800) {
+                s32 off_hi = (s32)((insn & 0x07FF) << 21) >> 9;
+                s32 off_lo = (insn2 & 0x07FF) << 1;
+                u32 bl_target = (u32)((s32)pc + off_hi + off_lo);
+                r[14] = pc | 1;
+
+                /* If BL target is in ROM, dispatch to recompiled code */
+                if ((bl_target >> 24) == 0x08) {
+                    cpu_bx(bl_target | 1); g_ret = 0;
+                    /* After BX returns, continue interpreting */
+                } else {
+                    /* BL to another RAM address - just update PC */
+                    pc = bl_target;
+                }
+            }
+            continue;
+        }
+
+        /* Unhandled instruction */
+        fprintf(stderr, "[interp] Unknown Thumb insn 0x%04X at 0x%08X\n", insn, pc - 2);
+        break;
+    }
+
+done:
+    /* The sentinel stood in for the caller's LR; wherever it ended up (lr,
+     * or the register a POP {rN}; BX rN return used) it is that LR again,
+     * so native code after us never sees 0xDEAD0001 */
+    for (int i = 0; i < 15; i++)
+        if ((r[i] & ~1u) == (return_sentinel & ~1u)) r[i] = saved_lr;
+    if (steps >= max_steps) {
+        static int _limit_warns = 0;
+        if (_limit_warns++ < 3) {
+            fprintf(stderr, "[interp] step limit hit at 0x%08X (%d steps), pc=0x%08X\n",
+                    target, steps, pc);
+            u32 base = (target & ~1u) & ~0x1Fu;
+            fprintf(stderr, "[interp]   bytes around target:");
+            for (int i = 0; i < 32; i += 2)
+                fprintf(stderr, " %04X", bus_read16(base + i));
+            fprintf(stderr, "\n[interp]   bytes around final pc:");
+            u32 pbase = pc & ~0x1Fu;
+            for (int i = 0; i < 32; i += 2)
+                fprintf(stderr, " %04X", bus_read16(pbase + i));
+            u16 ie = io_read16(0x200), if_v = io_read16(0x202), ime = io_read16(0x208);
+            fprintf(stderr, "\n[interp]   IE=0x%04X IF=0x%04X IME=%d DISPSTAT=0x%04X VCOUNT=%d\n",
+                    ie, if_v, ime, io_read16(0x004), io_read16(0x006) & 0xFF);
+        }
+    }
+}
+
+/* ---- BX Dispatch Tracing ---- */
+
+void cpu_bx_trace(u32 target) {
+    static int count = 0;
+    static u32 last = 0;
+    count++;
+    if (target != last && count <= 100) {
+        fprintf(stderr, "[bx #%d] -> 0x%08X\n", count, target);
+        fflush(stderr);
+    }
+    last = target;
+}
+
+/* cpu_bx() is generated in game_entry.c with a dispatch table */
+
+void cpu_undefined(u32 insn) {
+    fprintf(stderr, "[runtime] Undefined instruction 0x%08X at PC=0x%08X\n", insn, r[15]);
+}
+
+/* ---- Hardware Interface (called by gba_runtime.h API) ---- */
+
+void ppu_render_scanline(void) { /* PPU is frame-based via display.c */ }
+bool ppu_in_vblank(void) { return scanline >= VISIBLE_SCANLINES; }
+bool ppu_in_hblank(void) { return scanline_cycles >= HBLANK_START_CYCLE; }
+void apu_step(u32 cycles) { gba_audio_output_cycles(cycles); }
+void dma_check(void) { /* DMAs are triggered by io_write_hook */ }
+void timer_step(u32 cycles) { timer_tick(cycles); }
+void irq_check(void) { check_interrupts(); }
+
+void gba_run(void (*entry_func)(void)) {
+    /* Run the game with SoftReset support.
+     * SWI 0x00 (SoftReset) longjmps back here to restart. */
+    soft_reset_jmp_valid = true;
+    if (setjmp(soft_reset_jmp) != 0) {
+        /* Returned from SoftReset - game is restarting */
+        static int reset_count = 0;
+        reset_count++;
+        if (reset_count <= 5) {
+            fprintf(stderr, "[runtime] SoftReset #%d\n", reset_count);
+            fflush(stderr);
+        }
+    }
+    entry_func();
+    soft_reset_jmp_valid = false;
+}
+
+void gba_frame(void) {
+    /* Advance to next VBlank. Called from VBlankIntrWait and similar. */
+    u32 target_cycle = ((cycle_counter / CYCLES_PER_FRAME) + 1) * CYCLES_PER_FRAME
+                       + VISIBLE_SCANLINES * CYCLES_PER_SCANLINE;
+    while (cycle_counter < target_cycle) {
+        advance_cycles(CYCLES_PER_SCANLINE);
+    }
+}
+
+/* ---- SRAM Persistence ---- */
+
+static void sram_save(void) {
+    if (!sram || !sram_path[0]) return;
+    FILE* f = fopen(sram_path, "wb");
+    if (f) {
+        fwrite(sram, 1, backup_size, f);
+        fclose(f);
+    }
+}
+
+static void sram_load(void) {
+    if (!sram || !sram_path[0]) return;
+    FILE* f = fopen(sram_path, "rb");
+    if (f) {
+        fread(sram, 1, backup_size, f);
+        fclose(f);
+        fprintf(stderr, "[runtime] Loaded SRAM from %s\n", sram_path);
+    }
+}
+
+/* ---- Init/Shutdown ---- */
+
+void gba_init(const char* rom_path) {
+    if (getenv("GBA_VALIDATE")) g_validate = atoi(getenv("GBA_VALIDATE"));
+    if (getenv("GBA_TRACE_UNWIND")) g_unwind_trace = atoi(getenv("GBA_TRACE_UNWIND"));
+
+    /* Allocate memory regions */
+    ewram   = calloc(1, 0x40000);
+    iwram   = calloc(1, 0x8000);
+    io_regs = calloc(1, 0x400);
+    palette = calloc(1, 0x400);
+    vram    = calloc(1, 0x18000);
+    oam     = calloc(1, 0x400);
+    sram    = calloc(1, 0x20000);
+
+    /* Load ROM */
+    FILE* f = fopen(rom_path, "rb");
+    if (!f) {
+        fprintf(stderr, "[runtime] Cannot open ROM: %s\n", rom_path);
+        exit(1);
+    }
+    fseek(f, 0, SEEK_END);
+    rom_size = (u32)ftell(f);
+    fseek(f, 0, SEEK_SET);
+    rom_data = malloc(rom_size);
+    if (fread(rom_data, 1, rom_size, f) != rom_size) {
+        fprintf(stderr, "[runtime] Failed to read ROM\n");
+        exit(1);
+    }
+    fclose(f);
+
+    /* Set up SRAM save path */
+    strncpy(sram_path, rom_path, sizeof(sram_path) - 5);
+    sram_path[sizeof(sram_path) - 5] = '\0';
+    char* dot = strrchr(sram_path, '.');
+    if (dot) strcpy(dot, ".sav");
+    else strcat(sram_path, ".sav");
+    flash_detect();
+    if (flash.present) {
+        backup_size = flash.large ? 0x20000 : 0x10000;
+        memset(sram, 0xFF, backup_size);  /* erased flash reads 0xFF */
+    }
+    sram_load();
+
+    /* Detect and set up EEPROM */
+    eeprom_detect();
+    if (eeprom.present) {
+        strncpy(eeprom.path, rom_path, sizeof(eeprom.path) - 5);
+        eeprom.path[sizeof(eeprom.path) - 5] = '\0';
+        char* dot2 = strrchr(eeprom.path, '.');
+        if (dot2) strcpy(dot2, ".eep");
+        else strcat(eeprom.path, ".eep");
+        eeprom_load();
+    }
+
+    /* Initialize CPU state (post-BIOS) */
+    memset(r, 0, sizeof(r));
+    r[13] = 0x03007F00;  /* SP - system/user mode */
+    r[15] = 0x08000000;  /* PC */
+    cpsr  = 0x0000001F;  /* System mode */
+
+    /* Set up IRQ stack pointer at standard location */
+    /* (Games expect r13_irq = 0x03007FA0) */
+
+    /* Initialize KEYINPUT to all released */
+    io_regs[0x130] = 0xFF;
+    io_regs[0x131] = 0x03;
+
+    /* Initialize SOUNDBIAS to default */
+    io_regs[0x088] = 0x00;
+    io_regs[0x089] = 0x02; /* 0x0200 = default SOUNDBIAS */
+
+    /* Initialize SIO registers for "no link cable connected".
+     * On real hardware the SIOMULTI[0..3] data registers (0x120-0x127)
+     * read as 0xFFFF when no remote unit is attached - pull-ups bring
+     * the unconnected lines high. SIOCNT (0x128) and SIOMLT_SEND (0x12A)
+     * default to 0. Games that probe for link-cable presence (LttP+Four
+     * Swords, Pokemon, Mario Kart Super Circuit, etc.) read these regs
+     * during boot; leaving them as zero looks like "cable present, no
+     * data yet" and can stall the boot state machine. */
+    for (int i = 0x120; i < 0x128; i++) io_regs[i] = 0xFF;
+
+    /* Initialize timer state */
+    memset(timers, 0, sizeof(timers));
+    memset(gba_sound_fifo, 0, sizeof(gba_sound_fifo));
+    memset(gba_audio_dma_busy, 0, sizeof(gba_audio_dma_busy));
+    gba_audio_cycle_phase = 0;
+    gba_audio_pcm_frames = 0;
+    gba_audio_frames = gba_audio_nonzero = 0;
+    gba_audio_diag_init();
+    gba_audio_previous_pcm[0] = gba_audio_previous_pcm[1] = 0;
+    gba_audio_ramp_from[0] = gba_audio_ramp_from[1] = 0;
+    gba_audio_ramp_remaining = 0;
+    gba_audio_master_was_on = false;
+    gba_audio_wait_for_first_sample = true;
+    gba_audio_ramps = 0;
+
+    fprintf(stderr, "[runtime] GBA static recomp runtime initialized\n");
+    fprintf(stderr, "[runtime] ROM: %u bytes (%s)\n", rom_size, rom_path);
+    fflush(stderr);
+
+    /* Initialize display */
+    if (display_init() != 0) {
+        fprintf(stderr, "[runtime] Failed to initialize display\n");
+        exit(1);
+    }
+}
+
+u32 g_func_ring[4096];
+u32 g_func_ring_i;
+u32 g_ret;
+int g_unwind_trace;
+
+void recomp_unwind_note(u32 retaddr) {
+    fprintf(stderr, "[unwind] frame %u: call site expecting %08X saw a return to %08X (last entered func_%08X)\n",
+            frame_count, retaddr, g_ret, g_func_ring[(g_func_ring_i - 1) & 4095]);
+    if (--g_unwind_trace == 0) fprintf(stderr, "[unwind] (further unwinds not logged)\n");
+}
+
+int g_hist_on;
+typedef struct { u32 addr, count, first; } HistEntry;
+static HistEntry hist[16384];
+static u32 hist_n, hist_seq;
+
+void recomp_hist(u32 addr) {
+    u32 h = (addr >> 1) & 16383;
+    while (hist[h].addr && hist[h].addr != addr) h = (h + 1) & 16383;
+    if (!hist[h].addr) { hist[h].addr = addr; hist[h].first = hist_seq++; hist_n++; }
+    hist[h].count++;
+}
+
+static int hist_cmp(const void* a, const void* b) {
+    const HistEntry* x = a; const HistEntry* y = b;   /* by first entry */
+    return x->first < y->first ? -1 : x->first > y->first;
+}
+
+static void hist_dump(void) {
+    static HistEntry out[16384];
+    u32 n = 0;
+    for (u32 i = 0; i < 16384; i++) if (hist[i].addr) out[n++] = hist[i];
+    qsort(out, n, sizeof(out[0]), hist_cmp);
+    fprintf(stderr, "[trace] frame %u: %u functions, in first-call order (count):", frame_count - 1, n);
+    for (u32 k = 0; k < n; k++)
+        fprintf(stderr, "%s%08X(%u)", k % 6 ? " " : "\n  ", out[k].addr, out[k].count);
+    fprintf(stderr, "\n");
+    memset(hist, 0, sizeof(hist));
+    hist_n = hist_seq = 0;
+    g_hist_on = 0;
+}
+
+/* Distinct functions among the last 4096 entered, in first-seen order
+ * (GBA_FUNC_TRACE at exit, GBA_FUNC_TRACE_AT=N[,N...] at those frames) */
+static void func_ring_dump(void) {
+    static u32 seen[4096], count[4096];
+    u32 n = 0;
+    for (u32 i = 0; i < 4096; i++) {
+        u32 a = g_func_ring[(g_func_ring_i + i) & 4095], k = 0;
+        if (!a) continue;
+        while (k < n && seen[k] != a) k++;
+        if (k == n) { seen[n] = a; count[n++] = 0; }
+        count[k]++;
+    }
+    fprintf(stderr, "[runtime] frame %u: last 4096 function entries, distinct (count):", frame_count);
+    for (u32 k = 0; k < n; k++)
+        fprintf(stderr, "%s%08X(%u)", k % 6 ? " " : "\n  ", seen[k], count[k]);
+    fprintf(stderr, "\n");
+}
+
+/* ---- Lockstep validation (GBA_VALIDATE=K) ----
+ *
+ * The first K calls of every recompiled function are run twice from the
+ * same machine state: natively, then through the interpreter. Registers and
+ * memory are compared, the native result is kept, and a mismatch names the
+ * function. Callees run natively in both, so a failure points at that one
+ * function's translation (or at the interpreter: both are suspects).
+ * Interrupts are held off while validating so both runs see the same world.
+ * See docs/conformance.md. */
+int g_validate = 0;
+
+typedef struct {
+    u8 ewram[0x40000], iwram[0x8000], io[0x400], pal[0x400], vram[0x18000], oam[0x400];
+    u32 r[16]; bool n, z, c, v; u32 cpsr, spsr;
+    u32 cycle_counter, scanline, scanline_cycles, hblank_done, last_poll_cycle, frame_count;
+    HWTimer timers[4];
+} MachineState;
+
+static void state_save(MachineState* s) {
+    memcpy(s->ewram, ewram, 0x40000); memcpy(s->iwram, iwram, 0x8000);
+    memcpy(s->io, io_regs, 0x400); memcpy(s->pal, palette, 0x400);
+    memcpy(s->vram, vram, 0x18000); memcpy(s->oam, oam, 0x400);
+    memcpy(s->r, r, sizeof(r));
+    s->n = CPU_N; s->z = CPU_Z; s->c = CPU_C; s->v = CPU_V; s->cpsr = cpsr; s->spsr = spsr;
+    s->cycle_counter = cycle_counter; s->scanline = scanline;
+    s->scanline_cycles = scanline_cycles; s->hblank_done = hblank_done;
+    s->last_poll_cycle = last_poll_cycle;
+    s->frame_count = frame_count;
+    memcpy(s->timers, timers, sizeof(timers));
+}
+
+static void state_load(const MachineState* s) {
+    memcpy(ewram, s->ewram, 0x40000); memcpy(iwram, s->iwram, 0x8000);
+    memcpy(io_regs, s->io, 0x400); memcpy(palette, s->pal, 0x400);
+    memcpy(vram, s->vram, 0x18000); memcpy(oam, s->oam, 0x400);
+    memcpy(r, s->r, sizeof(r));
+    CPU_N = s->n; CPU_Z = s->z; CPU_C = s->c; CPU_V = s->v; cpsr = s->cpsr; spsr = s->spsr;
+    cycle_counter = s->cycle_counter; scanline = s->scanline;
+    scanline_cycles = s->scanline_cycles; hblank_done = s->hblank_done;
+    last_poll_cycle = s->last_poll_cycle;
+    frame_count = s->frame_count;
+    memcpy(timers, s->timers, sizeof(timers));
+}
+
+/* First differing byte in [a, a+n), skipping [skip_lo, skip_hi). -1 if none. */
+static long first_diff(const u8* a, const u8* b, u32 n, u32 skip_lo, u32 skip_hi) {
+    for (u32 i = 0; i < n; i++)
+        if (a[i] != b[i] && !(i >= skip_lo && i < skip_hi)) return (long)i;
+    return -1;
+}
+
+static struct { u32 addr; u16 calls; u8 failed; u32 seen; } v_seen[32768];
+static int v_funcs, v_fail;
+
+int recomp_validate(u32 addr) {
+    if (g_validating || in_irq) return 0;
+    {
+        /* GBA_VALIDATE_RANGE=lo-hi (hex) and GBA_VALIDATE_FROM=frame narrow
+         * the validator to one area of code and one stretch of the run, so
+         * a large K stays affordable */
+        static int init; static u32 lo = 0, hi = 0xFFFFFFFFu, from = 0;
+        if (!init) {
+            init = 1;
+            const char* r = getenv("GBA_VALIDATE_RANGE");
+            if (r) { lo = (u32)strtoul(r, NULL, 16); const char* d = strchr(r, '-'); if (d) hi = (u32)strtoul(d + 1, NULL, 16); }
+            if (getenv("GBA_VALIDATE_FROM")) from = (u32)atol(getenv("GBA_VALIDATE_FROM"));
+        }
+        if (addr < lo || addr > hi || frame_count < from) return 0;
+    }
+    u32 h = (addr >> 1) & 32767;
+    while (v_seen[h].addr && v_seen[h].addr != addr) h = (h + 1) & 32767;
+    if (!v_seen[h].addr) { v_seen[h].addr = addr; v_funcs++; }
+    if (v_seen[h].calls >= g_validate || v_seen[h].failed) return 0;
+    {
+        /* GBA_VALIDATE_EVERY=N: only every Nth call. A validated call runs its
+         * callees unvalidated, so an outer function checked every time would
+         * hide everything below it; skipping lets the callees take turns. */
+        static u32 every;
+        if (!every) { const char* e = getenv("GBA_VALIDATE_EVERY"); every = e ? (u32)atol(e) : 1; if (!every) every = 1; }
+        if (v_seen[h].seen++ % every) return 0;
+    }
+    v_seen[h].calls++;
+
+    u32 target = recomp_lookup(addr);       /* with the Thumb bit */
+    void (*fn)(void) = recomp_lookup_fn(addr);
+    if (!fn) return 0;
+
+    static MachineState s0, s_native, s_interp;
+    g_validating = 1;
+    state_save(&s0);
+    int bx_depth0 = g_bx_depth;
+    u32 sp0 = r[13], lr0 = r[14];
+    if (setjmp(validate_jmp)) {
+        /* Over budget: never returns in reasonable time. Run it for real. */
+        state_load(&s0);
+        g_bx_depth = bx_depth0;
+        g_ret = 0;
+        v_seen[h].calls = 0xFFFF;
+        g_validating = 0;
+        return 0;
+    }
+    validate_deadline = cycle_counter + 2 * CYCLES_PER_FRAME;
+    g_ret = 0;
+    fn();
+    u32 ret_native = g_ret;
+    state_save(&s_native);
+    state_load(&s0);
+    validate_deadline = cycle_counter + 2 * CYCLES_PER_FRAME;
+    g_ret = 0;
+    run_iwram_function(target);
+    /* The interpreter returns through a sentinel LR; wherever it surfaces
+     * (lr, or a register a POP {rN}; BX rN return used) it stands for lr0 */
+    for (int i = 0; i < 15; i++)
+        if ((r[i] & ~1u) == 0xDEAD0000u) r[i] = lr0;
+    r[14] = s_native.r[14];
+    state_save(&s_interp);
+
+    /* Below the entry SP is scratch: native pushes the real LR where the
+     * interpreter pushes its sentinel, so the frame itself isn't compared */
+    u32 stk_hi = (sp0 & 0x7FFF), stk_lo = stk_hi > 0x800 ? stk_hi - 0x800 : 0;
+    char why[160] = "";
+    for (int i = 0; i < 14 && !why[0]; i++)
+        if (s_native.r[i] != s_interp.r[i])
+            snprintf(why, sizeof(why), "r%d native=%08X interp=%08X", i, s_native.r[i], s_interp.r[i]);
+    long d;
+    if (!why[0] && (d = first_diff(s_native.ewram, s_interp.ewram, 0x40000, 1, 0)) >= 0)
+        snprintf(why, sizeof(why), "EWRAM %08lX native=%02X interp=%02X", 0x02000000 + d, s_native.ewram[d], s_interp.ewram[d]);
+    if (!why[0] && (d = first_diff(s_native.iwram, s_interp.iwram, 0x8000, stk_lo, stk_hi)) >= 0)
+        snprintf(why, sizeof(why), "IWRAM %08lX native=%02X interp=%02X", 0x03000000 + d, s_native.iwram[d], s_interp.iwram[d]);
+    if (!why[0] && (d = first_diff(s_native.pal, s_interp.pal, 0x400, 1, 0)) >= 0)
+        snprintf(why, sizeof(why), "PAL +%03lX", d);
+    if (!why[0] && (d = first_diff(s_native.vram, s_interp.vram, 0x18000, 1, 0)) >= 0)
+        snprintf(why, sizeof(why), "VRAM +%05lX", d);
+    if (!why[0] && (d = first_diff(s_native.oam, s_interp.oam, 0x400, 1, 0)) >= 0)
+        snprintf(why, sizeof(why), "OAM +%03lX", d);
+    if (why[0]) {
+        v_seen[h].failed = 1; v_fail++;
+        fprintf(stderr, "VALIDATE %08X FAIL %s (sp=%08X lr=%08X frame=%u)\n", addr, why, sp0, lr0, frame_count);
+    }
+    state_load(&s_native);
+    g_ret = ret_native;
+    g_validating = 0;
+    return 1;
+}
+
+void gba_shutdown(void) {
+    gba_audio_flush();
+    gba_audio_diag_finish();
+    gba_audio_report();
+    if (getenv("GBA_FUNC_TRACE")) func_ring_dump();
+    if (g_validate)
+        fprintf(stderr, "validate: %d/%d functions agree (native vs interpreter)\n",
+                v_funcs - v_fail, v_funcs);
+    sram_save();
+    eeprom_save();
+    display_shutdown();
+    free(ewram);    ewram = NULL;
+    free(iwram);    iwram = NULL;
+    free(io_regs);  io_regs = NULL;
+    free(palette);  palette = NULL;
+    free(vram);     vram = NULL;
+    free(oam);      oam = NULL;
+    free(rom_data); rom_data = NULL;
+    free(sram);     sram = NULL;
+    fprintf(stderr, "[runtime] Shutdown\n");
+}

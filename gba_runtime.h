@@ -1,0 +1,258 @@
+/*
+ * GBA Runtime Library Header
+ * Provides the CPU state, memory bus, and hardware interface
+ * that recompiled game code links against.
+ *
+ * This will eventually wrap libmgba. For now it's a standalone
+ * implementation sufficient to compile and test generated code.
+ */
+
+#ifndef GBA_RUNTIME_H
+#define GBA_RUNTIME_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+typedef uint8_t  u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+typedef int8_t   s8;
+typedef int16_t  s16;
+typedef int32_t  s32;
+typedef int64_t  s64;
+
+/* ---- CPU State ---- */
+
+/* ARM7TDMI register file: r0-r15 (r13=SP, r14=LR, r15=PC) */
+extern u32 r[16];
+
+/* Condition flags */
+extern bool CPU_N;  /* Negative */
+extern bool CPU_Z;  /* Zero */
+extern bool CPU_C;  /* Carry */
+extern bool CPU_V;  /* Overflow */
+
+/* ---- Utility macros ---- */
+
+static inline u32 ROR32(u32 val, u32 amount) {
+    amount &= 31;
+    if (amount == 0) return val;
+    return (val >> amount) | (val << (32 - amount));
+}
+
+static inline u32 RRX(u32 val) {
+    return (CPU_C ? 0x80000000u : 0) | (val >> 1);
+}
+
+/* Safe shift operations matching ARM7TDMI behavior.
+ * C has undefined behavior for shift >= 32; ARM defines precise results. */
+static inline u32 arm_lsl(u32 val, u32 amount) {
+    if (amount == 0) return val;
+    if (amount >= 32) return 0;
+    return val << amount;
+}
+
+static inline u32 arm_lsr(u32 val, u32 amount) {
+    if (amount == 0) return val;
+    if (amount >= 32) return 0;
+    return val >> amount;
+}
+
+static inline u32 arm_asr(u32 val, u32 amount) {
+    if (amount == 0) return val;
+    if (amount >= 32) return ((s32)val < 0) ? 0xFFFFFFFF : 0;
+    return (u32)((s32)val >> amount);
+}
+
+/* ---- Flag updates ---- */
+
+static inline void cpu_update_nz(u32 result) {
+    CPU_N = (result >> 31) != 0;
+    CPU_Z = (result == 0);
+}
+
+/* ADD with flag update. If dest is NULL, only flags are updated (CMN). */
+static inline void cpu_add(u32* dest, u32 a, u32 b, bool set_flags) {
+    u64 result64 = (u64)a + (u64)b;
+    u32 result = (u32)result64;
+    if (dest) *dest = result;
+    if (set_flags) {
+        CPU_N = (result >> 31) != 0;
+        CPU_Z = (result == 0);
+        CPU_C = (result64 >> 32) != 0;
+        CPU_V = ((~(a ^ b) & (a ^ result)) >> 31) != 0;
+    }
+}
+
+/* SUB with flag update. If dest is NULL, only flags are updated (CMP). */
+static inline void cpu_sub(u32* dest, u32 a, u32 b, bool set_flags) {
+    u32 result = a - b;
+    if (dest) *dest = result;
+    if (set_flags) {
+        CPU_N = (result >> 31) != 0;
+        CPU_Z = (result == 0);
+        CPU_C = (a >= b); /* borrow = !carry for ARM */
+        CPU_V = (((a ^ b) & (a ^ result)) >> 31) != 0;
+    }
+}
+
+/* ADC with full flag computation */
+static inline void cpu_adc(u32* dest, u32 a, u32 b, bool set_flags) {
+    u32 carry = CPU_C ? 1 : 0;
+    u64 result64 = (u64)a + (u64)b + (u64)carry;
+    u32 result = (u32)result64;
+    if (dest) *dest = result;
+    if (set_flags) {
+        CPU_N = (result >> 31) != 0;
+        CPU_Z = (result == 0);
+        CPU_C = (result64 >> 32) != 0;
+        CPU_V = ((~(a ^ b) & (a ^ result)) >> 31) != 0;
+    }
+}
+
+/* SBC: a - b - !carry */
+static inline void cpu_sbc(u32* dest, u32 a, u32 b, bool set_flags) {
+    u32 borrow = CPU_C ? 0 : 1;
+    u32 result = a - b - borrow;
+    if (dest) *dest = result;
+    if (set_flags) {
+        CPU_N = (result >> 31) != 0;
+        CPU_Z = (result == 0);
+        CPU_C = (u64)a >= (u64)b + (u64)borrow;
+        CPU_V = (((a ^ b) & (a ^ result)) >> 31) != 0;
+    }
+}
+
+/* cpu_update_flags_sub removed - use cpu_sub instead */
+
+/* ---- CPSR/SPSR ---- */
+
+u32  cpu_get_cpsr(void);
+void cpu_set_cpsr(u32 value, u32 mask);
+u32  cpu_get_spsr(void);
+void cpu_set_spsr(u32 value, u32 mask);
+
+/* ---- Memory Bus ---- */
+
+/* GBA memory map (active ranges):
+ *   0x00000000 - BIOS (16KB)
+ *   0x02000000 - EWRAM (256KB)
+ *   0x03000000 - IWRAM (32KB)
+ *   0x04000000 - I/O Registers
+ *   0x05000000 - Palette RAM (1KB)
+ *   0x06000000 - VRAM (96KB)
+ *   0x07000000 - OAM (1KB)
+ *   0x08000000 - ROM (up to 32MB, mirrored at 0x09-0x0D)
+ *   0x0E000000 - SRAM/Flash
+ */
+
+u32 bus_read32(u32 addr);
+u16 bus_read16(u32 addr);
+u8  bus_read8(u32 addr);
+u32 bus_read32s(u32 addr);   /* an LDM/POP's later words: no internal cycle */
+
+void bus_write32(u32 addr, u32 value);
+void bus_write16(u32 addr, u16 value);
+void bus_write8(u32 addr, u8 value);
+
+/* Opcode time the generated code charges at each block start, in 16-bit
+ * fetches (an ARM opcode is two, plus a pipeline refill); data accesses
+ * charge themselves, timed as mGBA does (see runtime.c data_cycles) */
+void cpu_fetches(u32 n);
+
+/* ---- Hardware ---- */
+
+/* Software interrupt (BIOS call) */
+void gba_swi(u32 number);
+
+/* Indirect branch (BX to register value) - runtime dispatch */
+void cpu_bx(u32 target);
+
+/* Last 4096 recompiled function entries, for "where is it stuck" diagnosis
+ * (printed at exit when GBA_FUNC_TRACE is set). One store per call. */
+extern u32 g_func_ring[4096];
+extern u32 g_func_ring_i;
+extern int g_validate;
+extern int g_bx_depth;   /* cpu_bx nesting (generated in game_entry.c) */
+
+/* Return-target tracking. Recompiled functions return through the C stack,
+ * but GBA code can return somewhere other than its caller: an epilogue that
+ * pops an outer frame (tail-shared code), or longjmp. Every return records
+ * where it actually goes (RECOMP_RETURN); every call site checks it
+ * (RECOMP_CALLED) and, if it isn't this site's continuation, returns too, so
+ * the unwind continues up the C stack to the frame it belongs to.
+ * 0 = "returned normally / nothing to check". See docs/analysis.md. */
+extern u32 g_ret;
+#define RECOMP_RETURN(target) do { g_ret = (u32)(target) | 1u; return; } while (0)
+#define RECOMP_CALLED(retaddr) do { \
+        if (g_ret && ((g_ret ^ (u32)(retaddr)) & ~1u)) { \
+            if (g_unwind_trace) recomp_unwind_note(retaddr); \
+            return; \
+        } \
+        g_ret = 0; \
+    } while (0)
+/* GBA_TRACE_UNWIND=N: log the first N call sites an unwind passes through */
+extern int g_unwind_trace;
+void recomp_unwind_note(u32 retaddr);
+int recomp_validate(u32 addr);
+/* Per-frame call histogram for GBA_FUNC_TRACE_AT (on only for those frames) */
+extern int g_hist_on;
+void recomp_hist(u32 addr);
+#define RECOMP_ENTER(addr) do { \
+        g_func_ring[g_func_ring_i++ & 4095] = (addr); \
+        if (g_hist_on) recomp_hist(addr); \
+        if (g_validate && recomp_validate(addr)) return; \
+    } while (0)
+
+/* Dispatch-table lookups (generated in game_entry.c): the BX address of the
+ * recompiled function at `addr` (Thumb bit set as needed), and its body. */
+u32 recomp_lookup(u32 addr);
+void (*recomp_lookup_fn(u32 addr))(void);
+
+/* Run a function in IWRAM/EWRAM (pre-compiled or stub fallback) */
+void run_iwram_function(u32 target);
+
+/* Undefined instruction trap */
+void cpu_undefined(u32 insn);
+
+/* ---- PPU ---- */
+
+void ppu_render_scanline(void);
+bool ppu_in_vblank(void);
+bool ppu_in_hblank(void);
+
+/* ---- APU ---- */
+
+void apu_step(u32 cycles);
+
+/* ---- DMA ---- */
+
+void dma_check(void);
+
+/* ---- Timers ---- */
+
+void timer_step(u32 cycles);
+
+/* ---- Interrupts ---- */
+
+void irq_check(void);
+
+/* ---- Main loop ---- */
+
+/* Called once per frame by the recompiled game's main loop.
+ * Handles PPU rendering, audio mixing, input polling, etc. */
+void gba_frame(void);
+
+/* Initialize the GBA runtime (memory, PPU, APU, etc.) */
+void gba_init(const char* rom_path);
+
+/* Run the game with SoftReset support. Calls entry_func() in a loop,
+ * restarting from the top whenever SWI 0x00 (SoftReset) is called. */
+void gba_run(void (*entry_func)(void));
+
+/* Shutdown */
+void gba_shutdown(void);
+
+#endif /* GBA_RUNTIME_H */
